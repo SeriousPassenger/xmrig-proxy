@@ -61,30 +61,82 @@
 namespace xmrig {
 
 
-Storage<DaemonClient> DaemonClient::m_storage;
+    Storage<DaemonClient> DaemonClient::m_storage;
 
 
-static const char* kBlocktemplateBlob       = "blocktemplate_blob";
-static const char* kBlockhashingBlob        = "blockhashing_blob";
-static const char *kGetHeight               = "/getheight";
-static const char *kGetInfo                 = "/getinfo";
-static const char *kHash                    = "hash";
-static const char *kHeight                  = "height";
-static const char *kJsonRPC                 = "/json_rpc";
+    static const char* kBlocktemplateBlob       = "blocktemplate_blob";
+    static const char* kBlockhashingBlob        = "blockhashing_blob";
+    static const char *kGetHeight               = "/getheight";
+    static const char *kGetInfo                 = "/getinfo";
+    static const char *kHash                    = "hash";
+    static const char *kHeight                  = "height";
+    static const char *kJsonRPC                 = "/json_rpc";
 
-static constexpr size_t kBlobReserveSize    = 8;
 
-static const char kZMQGreeting[64] = { static_cast<char>(-1), 0, 0, 0, 0, 0, 0, 0, 0, 127, 3, 0, 'N', 'U', 'L', 'L' };
-static constexpr size_t kZMQGreetingSize1 = 11;
+    // DaemonClient3 extra_nonce layout:
+    //
+    //   [0..3]    = mutable proxy/NiceHash extra nonce, overwritten on submit
+    //   [4..19]   = preserved per-template random entropy
+    //   [20..31]  = fixed ASCII marker "/Heathcliff/"
+    //
+    // Serialized tx_extra shape:
+    //
+    //   02 20 [4 mutable bytes] [16 preserved random bytes] 2f4865617468636c6966662f
+    //
+    // 0x20 = 32-byte extra_nonce payload.
+    //
+    // This keeps the first 4 bytes compatible with XMRig-proxy / NiceHash style
+    // submit mutation while preserving 16 bytes of template-level uniqueness.
+    static constexpr size_t kMutableExtraNonceSize    = 4;
+    static constexpr size_t kPerTemplateRandomSize    = 16;
+    static constexpr char kExtraNonceMarkerHex[]      = "2f4865617468636c6966662f"; // "/Heathcliff/"
 
-static const char kZMQHandshake[] = "\4\x19\5READY\xbSocket-Type\0\0\0\3SUB";
-static const char kZMQSubscribe[] = "\0\x18\1json-minimal-chain_main";
+    static constexpr size_t kExtraNonceMarkerSize     = (sizeof(kExtraNonceMarkerHex) - 1) / 2;
+    static constexpr size_t kMarkerOffsetBytes        = kMutableExtraNonceSize + kPerTemplateRandomSize;
+    static constexpr size_t kBlobReserveSize          = kMarkerOffsetBytes + kExtraNonceMarkerSize;
+
+    static_assert(
+        (sizeof(kExtraNonceMarkerHex) - 1) % 2 == 0,
+                  "extra_nonce marker hex must have an even number of characters"
+    );
+
+    static_assert(
+        kExtraNonceMarkerSize == 12,
+        "unexpected extra_nonce marker size"
+    );
+
+    static_assert(
+        kBlobReserveSize == 32,
+        "DaemonClient3 expected a 32-byte extra_nonce payload"
+    );
+
+    static_assert(
+        kMarkerOffsetBytes + kExtraNonceMarkerSize == kBlobReserveSize,
+        "extra_nonce marker must end exactly at the end of the payload"
+    );
+
+    static_assert(
+        kBlobReserveSize <= 127,
+        "keep extra_nonce payload in the conservative one-byte length range"
+    );
+
+    static_assert(
+        kBlobReserveSize <= 255,
+        "extra_nonce payload exceeds Monero TX_EXTRA_NONCE_MAX_COUNT"
+    );
+
+
+    static const char kZMQGreeting[64] = { static_cast<char>(-1), 0, 0, 0, 0, 0, 0, 0, 0, 127, 3, 0, 'N', 'U', 'L', 'L' };
+    static constexpr size_t kZMQGreetingSize1 = 11;
+
+    static const char kZMQHandshake[] = "\4\x19\5READY\xbSocket-Type\0\0\0\3SUB";
+    static const char kZMQSubscribe[] = "\0\x18\1json-minimal-chain_main";
 
 } // namespace xmrig
 
 
 xmrig::DaemonClient::DaemonClient(int id, IClientListener *listener) :
-    BaseClient(id, listener)
+BaseClient(id, listener)
 {
     m_httpListener  = std::make_shared<HttpListener>(this);
     m_timer         = new Timer(this);
@@ -122,11 +174,11 @@ bool xmrig::DaemonClient::disconnect()
 
 bool xmrig::DaemonClient::isTLS() const
 {
-#   ifdef XMRIG_FEATURE_TLS
+    #   ifdef XMRIG_FEATURE_TLS
     return m_pool.isTLS();
-#   else
+    #   else
     return false;
-#   endif
+    #   endif
 }
 
 
@@ -140,7 +192,7 @@ int64_t xmrig::DaemonClient::submit(const JobResult &result)
 
     const size_t sig_offset = m_job.nonceOffset() + m_job.nonceSize();
 
-#   ifdef XMRIG_PROXY_PROJECT
+    #   ifdef XMRIG_PROXY_PROJECT
 
     memcpy(data + m_job.nonceOffset() * 2, result.nonce, 8);
 
@@ -156,10 +208,23 @@ int64_t xmrig::DaemonClient::submit(const JobResult &result)
     }
 
     if (result.extra_nonce >= 0) {
-        Cvt::toHex(data + m_blocktemplate.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) * 2, 8, reinterpret_cast<const uint8_t*>(&result.extra_nonce), 4);
+        if (m_blocktemplate.txExtraNonce().size() < kMutableExtraNonceSize) {
+            if (!isQuiet()) {
+                LOG_ERR("%s " RED("submit error: ") RED_BOLD("\"tx extra nonce is too small\""), tag());
+            }
+
+            return -1;
+        }
+
+        Cvt::toHex(
+            data + m_blocktemplate.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) * 2,
+                   kMutableExtraNonceSize * 2,
+                   reinterpret_cast<const uint8_t*>(&result.extra_nonce),
+                   kMutableExtraNonceSize
+        );
     }
 
-#   else
+    #   else
 
     Cvt::toHex(data + m_job.nonceOffset() * 2, 8, reinterpret_cast<const uint8_t*>(&result.nonce), 4);
 
@@ -167,7 +232,7 @@ int64_t xmrig::DaemonClient::submit(const JobResult &result)
         Cvt::toHex(data + sig_offset * 2, 128, result.minerSignature(), 64);
     }
 
-#   endif
+    #   endif
 
     using namespace rapidjson;
     Document doc(kObjectType);
@@ -177,11 +242,11 @@ int64_t xmrig::DaemonClient::submit(const JobResult &result)
 
     JsonRequest::create(doc, m_sequence, "submitblock", params);
 
-#   ifdef XMRIG_PROXY_PROJECT
+    #   ifdef XMRIG_PROXY_PROJECT
     m_results[m_sequence] = SubmitResult(m_sequence, result.diff, result.actualDiff(), result.id, 0);
-#   else
+    #   else
     m_results[m_sequence] = SubmitResult(m_sequence, result.diff, result.actualDiff(), 0, result.backend);
-#   endif
+    #   endif
 
     std::map<std::string, std::string> headers;
     headers.insert({"X-Hash-Difficulty", std::to_string(result.actualDiff())});
@@ -252,10 +317,10 @@ void xmrig::DaemonClient::onHttpData(const HttpData &data)
 
     m_ip = data.ip().c_str();
 
-#   ifdef XMRIG_FEATURE_TLS
+    #   ifdef XMRIG_FEATURE_TLS
     m_tlsVersion     = data.tlsVersion();
     m_tlsFingerprint = data.tlsFingerprint();
-#   endif
+    #   endif
 
     rapidjson::Document doc;
     if (doc.Parse(data.body.c_str()).HasParseError()) {
@@ -400,20 +465,20 @@ bool xmrig::DaemonClient::parseJob(const rapidjson::Value &params, int *code)
         return jobError("Invalid block template received from daemon.");
     }
 
-#   ifdef XMRIG_PROXY_PROJECT
+    #   ifdef XMRIG_PROXY_PROJECT
     const size_t k = m_blocktemplate.offset(BlockTemplate::MINER_TX_PREFIX_OFFSET);
     job.setMinerTx(
         m_blocktemplate.blob() + k,
-        m_blocktemplate.blob() + m_blocktemplate.offset(BlockTemplate::MINER_TX_PREFIX_END_OFFSET),
-        m_blocktemplate.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET) - k,
-        m_blocktemplate.offset(BlockTemplate::TX_PUBKEY_OFFSET) - k,
-        m_blocktemplate.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) - k,
-        m_blocktemplate.txExtraNonce().size(),
-        m_blocktemplate.minerTxMerkleTreeBranch(),
-        m_blocktemplate.minerTxMerkleTreePath(),
-        m_blocktemplate.outputType() == 3
+                   m_blocktemplate.blob() + m_blocktemplate.offset(BlockTemplate::MINER_TX_PREFIX_END_OFFSET),
+                   m_blocktemplate.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET) - k,
+                   m_blocktemplate.offset(BlockTemplate::TX_PUBKEY_OFFSET) - k,
+                   m_blocktemplate.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) - k,
+                   m_blocktemplate.txExtraNonce().size(),
+                   m_blocktemplate.minerTxMerkleTreeBranch(),
+                   m_blocktemplate.minerTxMerkleTreePath(),
+                   m_blocktemplate.outputType() == 3
     );
-#   endif
+    #   endif
 
     m_blockhashingblob = Json::getString(params, kBlockhashingBlob);
 
@@ -436,9 +501,9 @@ bool xmrig::DaemonClient::parseJob(const rapidjson::Value &params, int *code)
             return jobError("Secret spend key is invalid.");
         }
 
-#       ifdef XMRIG_PROXY_PROJECT
+        #       ifdef XMRIG_PROXY_PROJECT
         job.setSpendSecretKey(secret_spendkey);
-#       else
+        #       else
         uint8_t secret_viewkey[32];
         derive_view_secret_key(secret_spendkey, secret_viewkey);
 
@@ -468,7 +533,7 @@ bool xmrig::DaemonClient::parseJob(const rapidjson::Value &params, int *code)
         derive_secret_key(derivation, 0, secret_spendkey, eph_secret_key);
 
         job.setEphemeralKeys(m_blocktemplate.blob(BlockTemplate::EPH_PUBLIC_KEY_OFFSET), eph_secret_key);
-#       endif
+        #       endif
     }
 
     if (m_coin.isValid()) {
@@ -555,7 +620,27 @@ int64_t xmrig::DaemonClient::getBlockTemplate()
 
     Value params(kObjectType);
     params.AddMember("wallet_address", m_user.toJSON(), allocator);
-    params.AddMember("extra_nonce", Cvt::toHex(Cvt::randomBytes(kBlobReserveSize)).toJSON(doc), allocator);
+
+    auto extraNonce = Cvt::toHex(Cvt::randomBytes(kBlobReserveSize));
+
+    // DaemonClient3 layout:
+    //
+    //   [0..3]    = mutable proxy/NiceHash extra nonce, overwritten on submit
+    //   [4..19]   = preserved random per-template entropy
+    //   [20..31]  = fixed ASCII marker "/Heathcliff/"
+    //
+    // Serialized tx_extra extra_nonce payload:
+    //
+    //   02 20 [4 mutable bytes] [16 random bytes] 2f4865617468636c6966662f
+    //
+    // All offsets are byte offsets. extraNonce is hex-encoded, so multiply by 2.
+    memcpy(
+        extraNonce.data() + kMarkerOffsetBytes * 2,
+           kExtraNonceMarkerHex,
+           sizeof(kExtraNonceMarkerHex) - 1
+    );
+
+    params.AddMember("extra_nonce", extraNonce.toJSON(doc), allocator);
 
     JsonRequest::create(doc, m_sequence, "getblocktemplate", params);
 
@@ -617,7 +702,7 @@ void xmrig::DaemonClient::setState(SocketState state)
     m_state = state;
 
     switch (state) {
-    case ConnectedState:
+        case ConnectedState:
         {
             m_failures = 0;
             m_listener->onLoginSuccess(this);
@@ -633,13 +718,13 @@ void xmrig::DaemonClient::setState(SocketState state)
         }
         break;
 
-    case UnconnectedState:
-        m_failures = -1;
-        m_timer->stop();
-        break;
+        case UnconnectedState:
+            m_failures = -1;
+            m_timer->stop();
+            break;
 
-    default:
-        break;
+        default:
+            break;
     }
 }
 
@@ -678,9 +763,9 @@ void xmrig::DaemonClient::onZMQClose(uv_handle_t* handle)
 {
     DaemonClient* client = getClient(handle->data);
     if (client) {
-#       ifdef APP_DEBUG
+        #       ifdef APP_DEBUG
         LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" disconnected"), client->m_pool.host().data(), client->m_pool.zmq_port());
-#       endif
+        #       endif
         client->m_ZMQConnectionState = ZMQ_NOT_CONNECTED;
     }
 }
@@ -690,9 +775,9 @@ void xmrig::DaemonClient::onZMQShutdown(uv_handle_t* handle)
 {
     DaemonClient* client = getClient(handle->data);
     if (client) {
-#       ifdef APP_DEBUG
+        #       ifdef APP_DEBUG
         LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" shutdown"), client->m_pool.host().data(), client->m_pool.zmq_port());
-#       endif
+        #       endif
         client->m_ZMQConnectionState = ZMQ_NOT_CONNECTED;
         m_storage.remove(client->m_key);
     }
@@ -701,9 +786,9 @@ void xmrig::DaemonClient::onZMQShutdown(uv_handle_t* handle)
 
 void xmrig::DaemonClient::ZMQConnected()
 {
-#   ifdef APP_DEBUG
+    #   ifdef APP_DEBUG
     LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" connected"), m_pool.host().data(), m_pool.zmq_port());
-#   endif
+    #   endif
 
     m_ZMQConnectionState = ZMQ_GREETING_1;
     m_ZMQSendBuf.reserve(256);
@@ -747,76 +832,76 @@ void xmrig::DaemonClient::ZMQRead(ssize_t nread, const uv_buf_t* buf)
 
     do {
         switch (m_ZMQConnectionState) {
-        case ZMQ_GREETING_1:
-            if (m_ZMQRecvBuf.size() >= kZMQGreetingSize1) {
-                if ((m_ZMQRecvBuf[0] == static_cast<char>(-1)) && (m_ZMQRecvBuf[9] == 127) && (m_ZMQRecvBuf[10] == 3)) {
-                    ZMQWrite(kZMQGreeting + kZMQGreetingSize1, sizeof(kZMQGreeting) - kZMQGreetingSize1);
-                    m_ZMQConnectionState = ZMQ_GREETING_2;
+            case ZMQ_GREETING_1:
+                if (m_ZMQRecvBuf.size() >= kZMQGreetingSize1) {
+                    if ((m_ZMQRecvBuf[0] == static_cast<char>(-1)) && (m_ZMQRecvBuf[9] == 127) && (m_ZMQRecvBuf[10] == 3)) {
+                        ZMQWrite(kZMQGreeting + kZMQGreetingSize1, sizeof(kZMQGreeting) - kZMQGreetingSize1);
+                        m_ZMQConnectionState = ZMQ_GREETING_2;
+                        break;
+                    }
+
+                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid greeting format"), tag());
+                    ZMQClose();
+                }
+                return;
+
+            case ZMQ_GREETING_2:
+                if (m_ZMQRecvBuf.size() >= sizeof(kZMQGreeting)) {
+                    if (memcmp(m_ZMQRecvBuf.data() + 12, kZMQGreeting + 12, 20) == 0) {
+                        m_ZMQConnectionState = ZMQ_HANDSHAKE;
+                        m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + sizeof(kZMQGreeting));
+
+                        ZMQWrite(kZMQHandshake, sizeof(kZMQHandshake) - 1);
+                        break;
+                    }
+
+                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid greeting format 2"), tag());
+                    ZMQClose();
+
+                }
+                return;
+
+            case ZMQ_HANDSHAKE:
+                if (m_ZMQRecvBuf.size() >= 2) {
+                    if (m_ZMQRecvBuf[0] != 4) {
+                        LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake format"), tag());
+                        ZMQClose();
+                        return;
+                    }
+
+                    const size_t size = static_cast<unsigned char>(m_ZMQRecvBuf[1]);
+                    if (size < 18) {
+                        LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake size"), tag());
+                        ZMQClose();
+                        return;
+                    }
+
+                    if (m_ZMQRecvBuf.size() < size + 2) {
+                        return;
+                    }
+
+                    if (memcmp(m_ZMQRecvBuf.data() + 2, kZMQHandshake + 2, 18) != 0) {
+                        LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake data"), tag());
+                        ZMQClose();
+                        return;
+                    }
+
+                    ZMQWrite(kZMQSubscribe, sizeof(kZMQSubscribe) - 1);
+
+                    m_ZMQConnectionState = ZMQ_CONNECTED;
+                    m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + size + 2);
+
+                    getBlockTemplate();
                     break;
                 }
+                return;
 
-                LOG_ERR("%s " RED("ZMQ handshake failed: invalid greeting format"), tag());
-                ZMQClose();
-            }
-            return;
+            case ZMQ_CONNECTED:
+                ZMQParse();
+                return;
 
-        case ZMQ_GREETING_2:
-            if (m_ZMQRecvBuf.size() >= sizeof(kZMQGreeting)) {
-                if (memcmp(m_ZMQRecvBuf.data() + 12, kZMQGreeting + 12, 20) == 0) {
-                    m_ZMQConnectionState = ZMQ_HANDSHAKE;
-                    m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + sizeof(kZMQGreeting));
-
-                    ZMQWrite(kZMQHandshake, sizeof(kZMQHandshake) - 1);
-                    break;
-                }
-
-                LOG_ERR("%s " RED("ZMQ handshake failed: invalid greeting format 2"), tag());
-                ZMQClose();
-
-            }
-            return;
-
-        case ZMQ_HANDSHAKE:
-            if (m_ZMQRecvBuf.size() >= 2) {
-                if (m_ZMQRecvBuf[0] != 4) {
-                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake format"), tag());
-                    ZMQClose();
-                    return;
-                }
-
-                const size_t size = static_cast<unsigned char>(m_ZMQRecvBuf[1]);
-                if (size < 18) {
-                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake size"), tag());
-                    ZMQClose();
-                    return;
-                }
-
-                if (m_ZMQRecvBuf.size() < size + 2) {
-                    return;
-                }
-
-                if (memcmp(m_ZMQRecvBuf.data() + 2, kZMQHandshake + 2, 18) != 0) {
-                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake data"), tag());
-                    ZMQClose();
-                    return;
-                }
-
-                ZMQWrite(kZMQSubscribe, sizeof(kZMQSubscribe) - 1);
-
-                m_ZMQConnectionState = ZMQ_CONNECTED;
-                m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + size + 2);
-
-                getBlockTemplate();
-                break;
-            }
-            return;
-
-        case ZMQ_CONNECTED:
-            ZMQParse();
-            return;
-
-        default:
-            return;
+            default:
+                return;
         }
     } while (true);
 }
@@ -824,9 +909,9 @@ void xmrig::DaemonClient::ZMQRead(ssize_t nread, const uv_buf_t* buf)
 
 void xmrig::DaemonClient::ZMQParse()
 {
-#   ifdef APP_DEBUG
+    #   ifdef APP_DEBUG
     std::vector<char> msg;
-#   endif
+    #   endif
 
     size_t msg_size = 0;
 
@@ -878,9 +963,9 @@ void xmrig::DaemonClient::ZMQParse()
         }
 
         if (!command) {
-#           ifdef APP_DEBUG
+            #           ifdef APP_DEBUG
             msg.insert(msg.end(), data, data + size);
-#           endif
+            #           endif
 
             msg_size += size;
         }
@@ -891,10 +976,10 @@ void xmrig::DaemonClient::ZMQParse()
 
     m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + (data - m_ZMQRecvBuf.data()));
 
-#   ifdef APP_DEBUG
+    #   ifdef APP_DEBUG
     msg.push_back('\0');
     LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" read ") CYAN_BOLD("%zu") BLACK_BOLD(" bytes") " %s", m_pool.host().data(), m_pool.zmq_port(), msg.size() - 1, msg.data());
-#   endif
+    #   endif
 
     // Clear previous hash and check daemon height to guarantee that xmrig will call get_block_template RPC later
     // We can't call get_block_template directly because daemon is not ready yet
