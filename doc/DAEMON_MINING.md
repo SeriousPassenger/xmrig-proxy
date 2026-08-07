@@ -54,10 +54,20 @@ wallet address, rather than a subaddress, is recommended for
 ```json
 {
   "mode": "simple",
+  "donate-level": 0,
   "reuse-timeout": 0,
   "event-stream": {
     "enabled": true,
     "path": "/run/xmrig-proxy/events.sock"
+  },
+  "randomx-verifier": {
+    "enabled": true,
+    "path": "/run/xmrig-randomx-verifier/verifier.sock",
+    "timeout-ms": 5000,
+    "max-queue": 256,
+    "max-pending-per-miner": 8,
+    "max-consecutive-rejections": 8,
+    "candidate-max-per-minute": 12
   },
   "pools": [
     {
@@ -80,6 +90,46 @@ wallet address, rather than a subaddress, is recommended for
 milliseconds. ZMQ remains an accelerator rather than a dependency: the first
 template and periodic refreshes use HTTP RPC even while ZMQ is unavailable.
 `daemon-job-timeout` bounds individual daemon HTTP requests.
+
+## RandomX share verifier
+
+When `randomx-verifier.enabled` is true, locally handled RandomX shares are
+accepted or rejected using a hash computed by the separate full-memory
+verifier service. The proxy retains the exact hashing blob sent with every
+job, inserts the submitted nonce into an owned copy, sends that blob together
+with its exact seed hash over a framed Unix socket, compares all 32 computed
+hash bytes with the miner's claim, and derives difficulty from the computed
+hash. Only that verified result can update local share/hashrate statistics.
+
+Verifier-enabled startup is intentionally restricted to `mode: "simple"`,
+`donate-level: 0`, and enabled upstreams that are all Monero `rx/0` daemon
+pools. Mixed, ordinary-pool, and donation configurations are rejected instead
+of silently falling back to unverified local acceptance.
+
+The service must advertise protocol v1, fast mode, no light-mode fallback, and
+the `prepare_seed`, `release_seed`, and `verify` capabilities. The proxy asks it
+to prepare both `seed_hash` and `next_seed_hash`. Current, next, and previous
+seed contexts can therefore overlap, while seeds unused for 120 seconds are
+released. The newest daemon snapshot is held until its current seed is ready;
+miners are never given a job that cannot yet be verified.
+
+`max-queue` bounds all outstanding verification requests and
+`max-pending-per-miner` prevents one connection from consuming the complete
+queue. A disconnected, unready, timed-out, malformed, full, or wrong-mode
+verifier fails closed. `max-consecutive-rejections` closes only the offending
+miner connection after that many consecutive rejected shares; `0` disables
+that connection-local strike limit. It never bans an IP, and another
+connection using the same username, rig ID, or address is unaffected.
+
+`candidate-max-per-minute` is also scoped to one miner connection and bounds
+claimed block-candidate submissions to monerod. Set it to `0` for unlimited
+regtest candidates. A syntactically valid share whose claimed difficulty meets
+the network target is submitted to monerod immediately; RandomX verification
+does not delay `submitblock`, and monerod remains the consensus authority.
+Claims below the network target always take the verifier path.
+
+Changing any `randomx-verifier` setting through config hot reload is reported
+but requires a proxy restart to take effect safely.
 
 With daemon-derived jobs, connection reuse is disabled internally because a
 new miner connection must receive independently generated entropy. Setting
@@ -105,15 +155,25 @@ Events include:
 - `worker_connected`, `worker_login`, and `worker_disconnected`;
 - `template_refresh`, `template_cached`, `template_error`,
   `daemon_height_check`, `daemon_height_error`, and `zmq_new_block`;
-- `job_sent`, `share_received`, and `share_result`; and
+- `verifier_seed_prepare`, `verifier_seed_ready`, `verifier_seed_error`, and
+  `verifier_seed_release`;
+- `job_sent`, `share_received`, `verify_requested`, `verify_result`,
+  `verify_error`, `verify_mismatch`, and `share_result`; and
 - `submit_block` and `submit_block_result`.
 
 Empty CSV fields mean not applicable. Rows deliberately omit the upstream
 daemon wallet/config, passwords, raw templates, secret keys, and full RPC
 bodies. The `worker` column uses the downstream rig ID or falls back to that
-downstream connection's login. `share_diff` is derived from the result hash
-supplied by the miner; it is telemetry, not an independent RandomX
-revalidation.
+downstream connection's login. `share_received.share_diff` describes the
+miner's claim. With the verifier enabled, `verify_result.share_diff` and the
+eventual accepted `share_result.share_diff` are derived from the independently
+computed hash.
+
+The `verifier_seed_*` rows describe process-global verifier context lifecycle,
+not one miner or daemon-template-source instance. Their `source_id` may
+therefore be empty; correlate those rows by the full `seed_hash` instead.
+Ready and timeout rows include the observed control-request latency when it is
+available.
 
 Schema version 2 adds `source_id`. It is a nonzero, process-unique identifier
 for one shared daemon-template-source lifetime. Every miner using the same

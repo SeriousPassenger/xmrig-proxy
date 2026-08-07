@@ -57,6 +57,7 @@ public:
     }
 
     inline bool isEmpty() const             { return m_data.empty(); }
+    inline bool contains(uintptr_t id) const { return m_data.count(id) != 0; }
     inline size_t size() const              { return m_data.size(); }
 
 

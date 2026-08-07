@@ -51,6 +51,7 @@ class LiveEventStream;
 class Miner;
 class Miners;
 class ProxyDebug;
+class RandomXVerifier;
 class Server;
 class ShareLog;
 class TlsContext;
@@ -102,6 +103,7 @@ private:
     LiveEventStream *m_eventStream = nullptr;
     Miners *m_miners;
     ProxyDebug *m_debug;
+    RandomXVerifier *m_randomXVerifier = nullptr;
     ShareLog *m_shareLog;
     Stats *m_stats;
     std::vector<Server*> m_servers;

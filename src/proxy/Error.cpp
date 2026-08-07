@@ -39,6 +39,10 @@ static const char *kIncompatibleAlgorithm = "No compatible algorithm found, chan
 static const char *kIncorrectAlgorithm    = "Incorrect algorithm";
 static const char *kForbidden             = "Permission denied";
 static const char *kRouteNotFound         = "Algorithm negotiation failed";
+static const char *kDuplicateShare        = "Duplicate share";
+static const char *kInvalidResult         = "Invalid share result";
+static const char *kVerificationFailed    = "RandomX verification unavailable";
+static const char *kCandidateRateLimit    = "Candidate submission rate limit exceeded";
 
 } /* namespace xmrig */
 
@@ -76,6 +80,18 @@ const char *xmrig::Error::toString(int code)
 
     case RouteNotFound:
         return kRouteNotFound;
+
+    case DuplicateShare:
+        return kDuplicateShare;
+
+    case InvalidResult:
+        return kInvalidResult;
+
+    case VerificationFailed:
+        return kVerificationFailed;
+
+    case CandidateRateLimit:
+        return kCandidateRateLimit;
 
     default:
         break;

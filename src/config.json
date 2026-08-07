@@ -18,6 +18,15 @@
         "enabled": false,
         "path": "/run/xmrig-proxy/events.sock"
     },
+    "randomx-verifier": {
+        "enabled": false,
+        "path": "/run/xmrig-randomx-verifier/verifier.sock",
+        "timeout-ms": 5000,
+        "max-queue": 256,
+        "max-pending-per-miner": 8,
+        "max-consecutive-rejections": 8,
+        "candidate-max-per-minute": 12
+    },
     "bind": [
         {
             "host": "0.0.0.0",

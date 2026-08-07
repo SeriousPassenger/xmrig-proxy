@@ -29,6 +29,7 @@
 #include "base/tools/SecureRandom.h"
 #include "net/JobResult.h"
 #include "proxy/live/LiveEventStream.h"
+#include "proxy/RandomXVerifier.h"
 
 
 #include <algorithm>
@@ -80,6 +81,7 @@ bool DaemonClient::disconnect()
     }
 
     m_contexts.clear();
+    m_pendingSnapshot.reset();
     m_results.clear();
     m_httpListener.reset();
     m_job.reset();
@@ -164,6 +166,39 @@ void DaemonClient::onDaemonTemplate(const std::shared_ptr<const DaemonTemplateSo
         return;
     }
 
+    if (RandomXVerifier::instance()) {
+        RandomXVerifier::instance()->prepareSeed(snapshot->seedHash.data() ? snapshot->seedHash.data() : "");
+        RandomXVerifier::instance()->prepareSeed(snapshot->nextSeedHash.data() ? snapshot->nextSeedHash.data() : "");
+
+        if (!RandomXVerifier::instance()->isSeedReady(snapshot->seedHash.data() ? snapshot->seedHash.data() : "")) {
+            // Do not advertise work that the configured fail-closed verifier
+            // cannot yet check. Keep only the newest daemon snapshot while
+            // the current full-memory dataset is prepared.
+            m_pendingSnapshot = snapshot;
+            return;
+        }
+    }
+
+    m_pendingSnapshot.reset();
+    if (!installTemplate(snapshot) && !isQuiet()) {
+        LOG_ERR("%s " RED("job error: ") RED_BOLD("\"Unable to derive private 16-byte template job.\""), tag());
+    }
+}
+
+
+void DaemonClient::tick(uint64_t)
+{
+    if (!m_pendingSnapshot || !RandomXVerifier::instance()) {
+        return;
+    }
+
+    const char *seedHash = m_pendingSnapshot->seedHash.data() ? m_pendingSnapshot->seedHash.data() : "";
+    if (!RandomXVerifier::instance()->isSeedReady(seedHash)) {
+        return;
+    }
+
+    const std::shared_ptr<const DaemonTemplateSource::Snapshot> snapshot = m_pendingSnapshot;
+    m_pendingSnapshot.reset();
     if (!installTemplate(snapshot) && !isQuiet()) {
         LOG_ERR("%s " RED("job error: ") RED_BOLD("\"Unable to derive private 16-byte template job.\""), tag());
     }

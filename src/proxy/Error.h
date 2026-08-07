@@ -43,7 +43,11 @@ public:
         IncompatibleAlgorithm,
         IncorrectAlgorithm,
         Forbidden,
-        RouteNotFound
+        RouteNotFound,
+        DuplicateShare,
+        InvalidResult,
+        VerificationFailed,
+        CandidateRateLimit
     };
 
     static const char *toString(int code);

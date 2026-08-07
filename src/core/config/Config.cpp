@@ -80,9 +80,73 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
         }
     }
 
+    const rapidjson::Value &randomXVerifier = reader.getObject("randomx-verifier");
+    if (randomXVerifier.IsObject()) {
+        m_randomXVerifierEnabled = Json::getBool(randomXVerifier, "enabled", m_randomXVerifierEnabled);
+
+        if (randomXVerifier.HasMember("path")) {
+            const char *path = Json::getString(randomXVerifier, "path");
+            if (!path || path[0] != '/' || strlen(path) > 103) {
+                LOG_ERR("randomx-verifier.path must be an absolute Unix socket path of at most 103 bytes");
+                return false;
+            }
+            m_randomXVerifierPath = path;
+        }
+
+        m_randomXVerifierTimeout = std::max<uint64_t>(100, std::min<uint64_t>(60000,
+            Json::getUint64(randomXVerifier, "timeout-ms", m_randomXVerifierTimeout)));
+        m_randomXVerifierMaxQueue = std::max<unsigned>(1, std::min<unsigned>(65536,
+            Json::getUint(randomXVerifier, "max-queue", m_randomXVerifierMaxQueue)));
+        m_randomXVerifierMaxPendingPerMiner = std::max<unsigned>(1, std::min<unsigned>(1024,
+            Json::getUint(randomXVerifier, "max-pending-per-miner", m_randomXVerifierMaxPendingPerMiner)));
+        m_randomXVerifierMaxPendingPerMiner = std::min(m_randomXVerifierMaxPendingPerMiner,
+                                                       m_randomXVerifierMaxQueue);
+        m_randomXVerifierMaxConsecutiveRejections = std::min<unsigned>(1000,
+            Json::getUint(randomXVerifier, "max-consecutive-rejections", m_randomXVerifierMaxConsecutiveRejections));
+        m_randomXVerifierCandidateLimit = std::min<unsigned>(10000,
+            Json::getUint(randomXVerifier, "candidate-max-per-minute", m_randomXVerifierCandidateLimit));
+
+        if (m_randomXVerifierEnabled &&
+            (m_randomXVerifierPath.isEmpty() || m_randomXVerifierPath.data()[0] != '/' ||
+             m_randomXVerifierPath.size() > 103)) {
+            LOG_ERR("randomx-verifier is enabled without a valid absolute Unix socket path");
+            return false;
+        }
+    }
+
     setCustomDiff(reader.getUint64("custom-diff", m_diff));
     setMode(reader.getString("mode"));
     setWorkersMode(reader.getValue("workers"));
+
+    if (m_randomXVerifierEnabled) {
+        if (m_mode != SIMPLE_MODE) {
+            LOG_ERR("randomx-verifier requires mode=simple");
+            return false;
+        }
+        if (m_pools.donateLevel() != 0) {
+            LOG_ERR("randomx-verifier requires donate-level=0");
+            return false;
+        }
+
+        size_t enabledPools = 0;
+        for (const Pool &pool : m_pools.data()) {
+            if (!pool.isEnabled()) {
+                continue;
+            }
+
+            ++enabledPools;
+            const Algorithm algorithm = pool.algorithm().isValid() ? pool.algorithm() : pool.coin().algorithm();
+            if (pool.mode() != Pool::MODE_DAEMON || pool.coin() != Coin::MONERO || algorithm != Algorithm::RX_0) {
+                LOG_ERR("randomx-verifier requires every enabled pool to be a Monero rx/0 daemon pool");
+                return false;
+            }
+        }
+
+        if (enabledPools == 0) {
+            LOG_ERR("randomx-verifier requires at least one enabled Monero daemon pool");
+            return false;
+        }
+    }
 
     const rapidjson::Value &bind = reader.getArray("bind");
     if (bind.IsArray()) {
@@ -135,6 +199,16 @@ void xmrig::Config::getJSON(rapidjson::Document &doc) const
     eventStream.AddMember("enabled",               m_eventStreamEnabled, allocator);
     eventStream.AddMember("path",                  m_eventStreamPath.toJSON(doc), allocator);
     doc.AddMember("event-stream",                  eventStream, allocator);
+
+    Value randomXVerifier(kObjectType);
+    randomXVerifier.AddMember("enabled", m_randomXVerifierEnabled, allocator);
+    randomXVerifier.AddMember("path", m_randomXVerifierPath.toJSON(doc), allocator);
+    randomXVerifier.AddMember("timeout-ms", m_randomXVerifierTimeout, allocator);
+    randomXVerifier.AddMember("max-queue", m_randomXVerifierMaxQueue, allocator);
+    randomXVerifier.AddMember("max-pending-per-miner", m_randomXVerifierMaxPendingPerMiner, allocator);
+    randomXVerifier.AddMember("max-consecutive-rejections", m_randomXVerifierMaxConsecutiveRejections, allocator);
+    randomXVerifier.AddMember("candidate-max-per-minute", m_randomXVerifierCandidateLimit, allocator);
+    doc.AddMember("randomx-verifier", randomXVerifier, allocator);
 
     Value bind(kArrayType);
     for (const auto &host : m_bind) {

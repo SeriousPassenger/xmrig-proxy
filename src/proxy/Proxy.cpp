@@ -48,6 +48,7 @@
 #include "proxy/Miner.h"
 #include "proxy/Miners.h"
 #include "proxy/ProxyDebug.h"
+#include "proxy/RandomXVerifier.h"
 #include "proxy/Server.h"
 #include "proxy/splitters/donate/DonateSplitter.h"
 #include "proxy/splitters/extra_nonce/ExtraNonceSplitter.h"
@@ -110,6 +111,17 @@ xmrig::Proxy::Proxy(Controller *controller) :
 #       endif
     }
 
+    if (controller->config()->isRandomXVerifierEnabled()) {
+        m_randomXVerifier = new RandomXVerifier(
+            controller->config()->randomXVerifierPath().data(),
+            controller->config()->randomXVerifierTimeout(),
+            controller->config()->randomXVerifierMaxQueue(),
+            controller->config()->randomXVerifierMaxPendingPerMiner(),
+            controller->config()->randomXVerifierCandidateLimit(),
+            controller->config()->randomXVerifierMaxConsecutiveRejections()
+        );
+    }
+
     m_timer = new Timer(this);
 
 #   ifdef XMRIG_FEATURE_API
@@ -162,6 +174,10 @@ xmrig::Proxy::Proxy(Controller *controller) :
 
 xmrig::Proxy::~Proxy()
 {
+    if (m_randomXVerifier) {
+        m_randomXVerifier->stop();
+    }
+
     Events::stop();
 
 #   ifdef XMRIG_FEATURE_HTTP
@@ -189,6 +205,7 @@ xmrig::Proxy::~Proxy()
     delete m_debug;
     delete m_workers;
     delete m_eventStream;
+    delete m_randomXVerifier;
 
 #   ifdef XMRIG_FEATURE_TLS
     delete m_tls;
@@ -204,6 +221,11 @@ void xmrig::Proxy::connect()
 
     if (m_eventStream && !m_eventStream->start()) {
         LOG_ERR("Failed to start local event stream at \"%s\"", m_eventStream->path().c_str());
+    }
+
+    if (m_randomXVerifier && !m_randomXVerifier->start()) {
+        LOG_WARN("Failed to start RandomX verifier client for \"%s\"; local shares will fail closed",
+                 m_randomXVerifier->path().c_str());
     }
 
     m_splitter->connect();
@@ -272,9 +294,20 @@ void xmrig::Proxy::printState()
 #endif
 
 
-void xmrig::Proxy::onConfigChanged(xmrig::Config *config, xmrig::Config *)
+void xmrig::Proxy::onConfigChanged(xmrig::Config *config, xmrig::Config *previous)
 {
     m_debug->setEnabled(config->isDebug());
+
+    if (previous &&
+        (config->isRandomXVerifierEnabled() != previous->isRandomXVerifierEnabled() ||
+         config->randomXVerifierPath() != previous->randomXVerifierPath() ||
+         config->randomXVerifierTimeout() != previous->randomXVerifierTimeout() ||
+         config->randomXVerifierMaxQueue() != previous->randomXVerifierMaxQueue() ||
+         config->randomXVerifierMaxPendingPerMiner() != previous->randomXVerifierMaxPendingPerMiner() ||
+         config->randomXVerifierMaxConsecutiveRejections() != previous->randomXVerifierMaxConsecutiveRejections() ||
+         config->randomXVerifierCandidateLimit() != previous->randomXVerifierCandidateLimit())) {
+        LOG_WARN("randomx-verifier configuration changed; restart xmrig-proxy to apply it safely");
+    }
 }
 
 
@@ -317,6 +350,10 @@ void xmrig::Proxy::print()
 
 void xmrig::Proxy::tick()
 {
+    if (m_randomXVerifier) {
+        m_randomXVerifier->tick();
+    }
+
     m_stats->tick(m_ticks, m_splitter);
 
     m_ticks++;

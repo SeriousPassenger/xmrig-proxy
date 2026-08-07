@@ -51,6 +51,7 @@
 
 
 #include <cinttypes>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -89,6 +90,10 @@ xmrig::Miner::Miner(const TlsContext *ctx, uint16_t port, bool strictTls) :
 
 xmrig::Miner::~Miner()
 {
+    if (RandomXVerifier::instance()) {
+        RandomXVerifier::instance()->cancelOwner(m_key);
+    }
+
     if (uv_is_closing(reinterpret_cast<uv_handle_t *>(m_socket))) {
         delete m_socket;
     }
@@ -136,13 +141,16 @@ void xmrig::Miner::forwardJob(const Job &job, const char *algo)
     m_currentJobEntropy  = job.templateEntropy();
     m_jobHeight          = job.height();
     m_templateGeneration = job.templateGeneration();
+    m_signatureData      = job.rawSigKey();
+    m_viewTag            = 0;
+    m_extraNonce         = -1;
     setFixedByte(job.fixedByte());
 
     if (!sendJob(job.rawBlob(), job.id().data(), job.rawTarget(), algo ? algo : job.algorithm().name(), job.height(), job.rawSeedHash(), job.rawSigKey())) {
         return;
     }
 
-    rememberJob(job);
+    rememberJob(job, job.rawBlob());
 
     LiveEventStream::Row row("job_sent");
     if (job.templateSourceId()) {
@@ -192,6 +200,9 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     m_currentJobEntropy  = job.templateEntropy();
     m_jobHeight          = job.height();
     m_templateGeneration = job.templateGeneration();
+    m_signatureData      = nullptr;
+    m_viewTag            = 0;
+    m_extraNonce         = extra_nonce;
     bool customDiff = false;
 
     if (m_customDiff && m_customDiff < m_diff) {
@@ -215,7 +226,6 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     }
 
     if (extra_nonce >= 0) {
-        m_extraNonce = extra_nonce;
         job.setExtraNonceInMinerTx(static_cast<uint32_t>(m_extraNonce));
     }
 
@@ -228,7 +238,7 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
         return;
     }
 
-    rememberJob(job);
+    rememberJob(job, blob);
 
     LiveEventStream::Row row("job_sent");
     if (job.templateSourceId()) {
@@ -275,7 +285,8 @@ const xmrig::Miner::TelemetryJob *xmrig::Miner::findTelemetryJob(const String &i
     static constexpr uint64_t kTelemetryJobTtl = 120000;
     const uint64_t now = Chrono::steadyMSecs();
 
-    if (!m_telemetryJobs.empty() && m_telemetryJobs.front().id == id) {
+    if (!m_telemetryJobs.empty() && m_telemetryJobs.front().id == id &&
+        now < m_telemetryJobs.front().issuedAt + kTelemetryJobTtl) {
         return &m_telemetryJobs.front();
     }
 
@@ -295,24 +306,321 @@ const xmrig::Miner::TelemetryJob *xmrig::Miner::findTelemetryJob(const String &i
 }
 
 
-void xmrig::Miner::rememberJob(const Job &job)
+void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob)
 {
     static constexpr size_t kTelemetryJobCount = 6;
 
     TelemetryJob telemetry;
     telemetry.algorithm          = job.algorithm();
     telemetry.entropy            = job.templateEntropy();
+    telemetry.hashingBlob        = hashingBlob;
     telemetry.id                 = job.id();
+    telemetry.seedHash           = job.rawSeedHash();
+    telemetry.signatureData      = m_signatureData;
     telemetry.height             = job.height();
     telemetry.issuedAt           = Chrono::steadyMSecs();
     telemetry.minerDiff          = diff();
     telemetry.networkDiff        = job.diff();
+    telemetry.issuanceToken      = ++m_jobIssuanceSequence;
     telemetry.templateGeneration = job.templateGeneration();
     telemetry.templateSourceId   = job.templateSourceId();
+    telemetry.nonceOffset        = job.nonceOffset();
+    telemetry.viewTag            = m_viewTag;
+    telemetry.extraNonce         = m_extraNonce;
 
     m_telemetryJobs.push_front(std::move(telemetry));
     while (m_telemetryJobs.size() > kTelemetryJobCount) {
         m_telemetryJobs.pop_back();
+    }
+}
+
+
+bool xmrig::Miner::rememberSubmission(const char *jobId, const char *nonce)
+{
+    static constexpr uint64_t kSubmissionTtl = 120000;
+    static constexpr size_t kMaxRememberedSubmissions = 65536;
+
+    if (!jobId || !nonce) {
+        return false;
+    }
+
+    std::string key(jobId);
+    key.push_back(':');
+    key.append(nonce);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    const uint64_t now = Chrono::steadyMSecs();
+    while (!m_seenSubmissions.empty() &&
+           (now >= m_seenSubmissions.front().seenAt + kSubmissionTtl ||
+            m_seenSubmissions.size() >= kMaxRememberedSubmissions)) {
+        const SeenSubmission &oldest = m_seenSubmissions.front();
+        auto it = m_seenSubmissionTimes.find(oldest.key);
+        if (it != m_seenSubmissionTimes.end() && it->second == oldest.seenAt) {
+            m_seenSubmissionTimes.erase(it);
+        }
+        m_seenSubmissions.pop_front();
+    }
+
+    auto existing = m_seenSubmissionTimes.find(key);
+    if (existing != m_seenSubmissionTimes.end() && now < existing->second + kSubmissionTtl) {
+        return false;
+    }
+
+    SeenSubmission seen;
+    seen.key = key;
+    seen.seenAt = now;
+    m_seenSubmissions.push_back(seen);
+    m_seenSubmissionTimes[key] = now;
+    return true;
+}
+
+
+void xmrig::Miner::fillSubmitMetadata(SubmitEvent *event, const PendingShare &share) const
+{
+    if (!event) {
+        return;
+    }
+
+    event->request.shareId = share.shareId;
+    event->request.height = share.height;
+    event->request.minerDiff = share.minerDiff;
+    event->request.networkDiff = share.networkDiff;
+    event->request.templateGeneration = share.templateGeneration;
+    event->request.templateSourceId = share.templateSourceId;
+    event->request.templateEntropy = share.entropy.c_str();
+}
+
+
+bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job)
+{
+    RandomXVerifier *verifier = RandomXVerifier::instance();
+    if (!event || !verifier || job.algorithm != Algorithm::RX_0 ||
+        job.hashingBlob.isEmpty() || job.seedHash.size() != 64 ||
+        job.nonceOffset * 2 + 8 > job.hashingBlob.size()) {
+        return false;
+    }
+
+    auto share = std::make_shared<PendingShare>();
+    share->algorithm = job.algorithm;
+    share->mapperId = m_mapperId;
+    share->requestId = event->request.id;
+    share->extraNonce = event->request.extra_nonce;
+    share->viewTag = event->request.view_tag;
+    share->shareId = event->request.shareId;
+    share->height = job.height;
+    share->minerDiff = job.minerDiff;
+    share->networkDiff = job.networkDiff;
+    share->issuanceToken = job.issuanceToken;
+    share->verificationGeneration = m_verificationGeneration;
+    share->templateGeneration = job.templateGeneration;
+    share->templateSourceId = job.templateSourceId;
+    share->jobId = event->request.jobId.data() ? event->request.jobId.data() : "";
+    share->nonce = event->request.nonce ? event->request.nonce : "";
+    share->claimedHash = event->request.result ? event->request.result : "";
+    share->hashingBlob = job.hashingBlob.data();
+    share->seedHash = job.seedHash.data();
+    share->signature = event->request.sig ? event->request.sig : "";
+    share->signatureData = event->request.sig_data ? event->request.sig_data : "";
+    share->commitment = event->request.commitment ? event->request.commitment : "";
+    share->entropy = job.entropy.data() ? job.entropy.data() : "";
+    memcpy(&share->hashingBlob[job.nonceOffset * 2], share->nonce.data(), 8);
+
+    RandomXVerifier::Request request;
+    request.owner = m_key;
+    request.shareId = share->shareId;
+    request.seedHash = share->seedHash;
+    request.blob = share->hashingBlob;
+    request.claimedHash = share->claimedHash;
+    request.jobId = share->jobId;
+    request.nonce = share->nonce;
+
+    const uintptr_t key = m_key;
+    const bool queued = verifier->verify(request, [key, share](const RandomXVerifier::Result &result) {
+        if (!m_storage.contains(key)) {
+            return;
+        }
+
+        Miner *miner = m_storage.get(key);
+        if (miner) {
+            miner->completeVerification(share, result);
+        }
+    });
+
+    if (!queued) {
+        return false;
+    }
+
+    LiveEventStream::Row row("verify_requested");
+    row.minerId = m_id;
+    row.mapperId = m_mapperId;
+    row.minerIp = m_ip;
+    row.listenPort = m_localPort;
+    row.worker = rigId(true).data() ? rigId(true).data() : "";
+    row.agent = m_agent.data() ? m_agent.data() : "";
+    row.sourceId = share->templateSourceId;
+    row.templateId = std::to_string(share->templateGeneration);
+    row.height = share->height;
+    row.seedHash = share->seedHash;
+    row.algorithm = share->algorithm.name();
+    row.jobId = share->jobId;
+    row.entropyHex = share->entropy;
+    row.minerTargetDiff = share->minerDiff;
+    row.networkTargetDiff = share->networkDiff;
+    row.shareId = share->shareId;
+    row.minerRequestId = share->requestId;
+    row.nonce = share->nonce;
+    row.resultHash = share->claimedHash;
+    row.status = "requested";
+    LiveEventStream::publish(row);
+
+    return true;
+}
+
+
+void xmrig::Miner::rejectPendingShare(const PendingShare &share, Error::Code error)
+{
+    SubmitEvent *event = SubmitEvent::create(this, share.requestId, share.jobId.c_str(), share.nonce.c_str(),
+        share.claimedHash.c_str(), share.algorithm, share.signature.empty() ? nullptr : share.signature.c_str(),
+        share.signatureData.empty() ? nullptr : share.signatureData.c_str(),
+        share.commitment.empty() ? nullptr : share.commitment.c_str(), share.viewTag, share.extraNonce);
+    fillSubmitMetadata(event, share);
+    event->setError(error);
+    event->start();
+    replyWithError(share.requestId, Error::toString(error));
+    recordShareOutcome(false);
+}
+
+
+void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &share,
+                                        const RandomXVerifier::Result &result)
+{
+    if (!share || m_state == ClosingState) {
+        return;
+    }
+    const TelemetryJob *liveJob = findTelemetryJob(String(share->jobId.c_str()));
+    if (share->mapperId != m_mapperId ||
+        share->verificationGeneration != m_verificationGeneration ||
+        !liveJob || liveJob->issuanceToken != share->issuanceToken) {
+        return rejectPendingShare(*share, Error::InvalidJobId);
+    }
+
+    LiveEventStream::Row row(result.ok ? "verify_result" : "verify_error");
+    row.minerId = m_id;
+    row.mapperId = share->mapperId;
+    row.minerIp = m_ip;
+    row.listenPort = m_localPort;
+    row.worker = rigId(true).data() ? rigId(true).data() : "";
+    row.agent = m_agent.data() ? m_agent.data() : "";
+    row.sourceId = share->templateSourceId;
+    row.templateId = std::to_string(share->templateGeneration);
+    row.height = share->height;
+    row.seedHash = share->seedHash;
+    row.algorithm = share->algorithm.name();
+    row.jobId = share->jobId;
+    row.entropyHex = share->entropy;
+    row.minerTargetDiff = share->minerDiff;
+    row.networkTargetDiff = share->networkDiff;
+    row.shareId = share->shareId;
+    row.minerRequestId = share->requestId;
+    row.daemonRequestId = static_cast<int64_t>(result.requestId);
+    row.nonce = share->nonce;
+    row.resultHash = result.ok ? result.hash : share->claimedHash;
+    row.latencyMs = result.latencyMs;
+    row.status = result.ok ? "computed" : "error";
+    row.errorMessage = result.error;
+
+    if (!result.ok) {
+        LiveEventStream::publish(row);
+        return rejectPendingShare(*share, Error::VerificationFailed);
+    }
+
+    uint8_t claimed[32];
+    uint8_t computed[32];
+    const bool exact = Cvt::fromHex(claimed, sizeof(claimed), share->claimedHash.c_str(), share->claimedHash.size()) &&
+        Cvt::fromHex(computed, sizeof(computed), result.hash.c_str(), result.hash.size()) &&
+        memcmp(claimed, computed, sizeof(claimed)) == 0;
+
+    JobResult verified(share->requestId, share->jobId.c_str(), share->nonce.c_str(), result.hash.c_str(),
+                       share->algorithm, share->signature.empty() ? nullptr : share->signature.c_str(),
+                       share->signatureData.empty() ? nullptr : share->signatureData.c_str(),
+                       share->commitment.empty() ? nullptr : share->commitment.c_str(), share->viewTag,
+                       share->extraNonce);
+    row.shareDiff = verified.actualDiff();
+
+    if (!exact) {
+        row.event = "verify_mismatch";
+        row.status = "mismatch";
+        row.errorMessage = std::string("claimed=") + share->claimedHash + " computed=" + result.hash;
+        LiveEventStream::publish(row);
+        return rejectPendingShare(*share, Error::InvalidResult);
+    }
+
+    if (verified.actualDiff() == 0 || verified.actualDiff() < share->minerDiff) {
+        row.status = "low_difficulty";
+        LiveEventStream::publish(row);
+        return rejectPendingShare(*share, Error::LowDifficulty);
+    }
+
+    if (verified.actualDiff() >= share->networkDiff) {
+        row.status = "candidate";
+        LiveEventStream::publish(row);
+
+        SubmitEvent *event = SubmitEvent::create(this, share->requestId, share->jobId.c_str(), share->nonce.c_str(),
+            result.hash.c_str(), share->algorithm, share->signature.empty() ? nullptr : share->signature.c_str(),
+            share->signatureData.empty() ? nullptr : share->signatureData.c_str(),
+            share->commitment.empty() ? nullptr : share->commitment.c_str(), share->viewTag, share->extraNonce);
+        fillSubmitMetadata(event, *share);
+        Error::Code finalError = event->error();
+        event->setErrorSink(&finalError);
+        if (!event->start()) {
+            replyWithError(share->requestId, Error::toString(finalError));
+            recordShareOutcome(false);
+        }
+        return;
+    }
+
+    if (share->minerDiff >= share->networkDiff) {
+        row.status = "low_difficulty";
+        LiveEventStream::publish(row);
+        return rejectPendingShare(*share, Error::LowDifficulty);
+    }
+
+    row.status = "accepted_local";
+    LiveEventStream::publish(row);
+    success(share->requestId, "OK");
+
+    SubmitResult accepted(0, share->networkDiff, verified.actualDiff(), share->requestId, 0,
+                          share->shareId, String(share->jobId.c_str()), share->templateGeneration,
+                          share->height, String(share->entropy.c_str()), share->templateSourceId);
+    AcceptEvent::start(static_cast<size_t>(share->mapperId), this, accepted, false, true);
+    recordShareOutcome(true);
+}
+
+
+void xmrig::Miner::recordShareOutcome(bool accepted)
+{
+    RandomXVerifier *verifier = RandomXVerifier::instance();
+    if (!verifier) {
+        return;
+    }
+
+    if (accepted) {
+        m_consecutiveShareRejections = 0;
+        return;
+    }
+
+    const uint32_t limit = verifier->maxConsecutiveRejections();
+    if (limit == 0) {
+        return;
+    }
+
+    ++m_consecutiveShareRejections;
+    if (m_consecutiveShareRejections >= limit) {
+        LOG_WARN("[%s] closing miner after %u consecutive rejected shares", m_ip,
+                 m_consecutiveShareRejections);
+        shutdown(false);
     }
 }
 
@@ -326,6 +634,14 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
     if (m_state == WaitLoginState) {
         if (strcmp(method, "login") == 0) {
             setState(WaitReadyState);
+            // A fail-closed RandomX verifier may need to build the first
+            // full-memory dataset before upstream can safely issue a job.
+            // Keep the authenticated connection alive during that bounded
+            // readiness wait instead of applying the initial 10-second
+            // unauthenticated socket deadline.
+            if (RandomXVerifier::instance()) {
+                m_expire = Chrono::steadyMSecs() + 60000;
+            }
             m_loginId = id;
 
             Algorithms algorithms;
@@ -372,13 +688,18 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         }
 
         Algorithm algorithm(Json::getString(params, "algo"));
+        const char *submittedJobId = Json::getString(params, "job_id");
+        const String submittedJob(submittedJobId);
+        const TelemetryJob *telemetryJob = findTelemetryJob(submittedJob);
+        const String &signatureData = telemetryJob ? telemetryJob->signatureData : m_signatureData;
+        const uint8_t viewTag = telemetryJob ? telemetryJob->viewTag : m_viewTag;
+        const int64_t extraNonce = telemetryJob ? telemetryJob->extraNonce : m_extraNonce;
 
-        SubmitEvent *event = SubmitEvent::create(this, id, Json::getString(params, "job_id"), Json::getString(params, "nonce"), Json::getString(params, "result"), algorithm, Json::getString(params, "sig"), m_signatureData, Json::getString(params, "commitment"), m_viewTag, m_extraNonce);
+        SubmitEvent *event = SubmitEvent::create(this, id, submittedJobId, Json::getString(params, "nonce"), Json::getString(params, "result"), algorithm, Json::getString(params, "sig"), signatureData, Json::getString(params, "commitment"), viewTag, extraNonce);
         Error::Code finalError = event->error();
         event->setErrorSink(&finalError);
         event->request.shareId = ++s_shareSequence;
 
-        const TelemetryJob *telemetryJob = findTelemetryJob(event->request.jobId);
         if (telemetryJob) {
             event->request.templateEntropy    = telemetryJob->entropy;
             event->request.height             = telemetryJob->height;
@@ -421,7 +742,19 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         }
         LiveEventStream::publish(row);
 
-        if (!event->request.isValid()) {
+        uint8_t nonceBytes[4];
+        uint8_t resultBytes[32];
+        const bool validEncoding = event->request.nonce && event->request.result &&
+            strlen(event->request.nonce) == sizeof(nonceBytes) * 2 &&
+            strlen(event->request.result) == sizeof(resultBytes) * 2 &&
+            Cvt::fromHex(nonceBytes, sizeof(nonceBytes), event->request.nonce, sizeof(nonceBytes) * 2) &&
+            Cvt::fromHex(resultBytes, sizeof(resultBytes), event->request.result, sizeof(resultBytes) * 2);
+
+        RandomXVerifier *verifier = RandomXVerifier::instance();
+        const bool claimedCandidate = telemetryJob &&
+            event->request.actualDiff() >= telemetryJob->networkDiff;
+
+        if (!event->request.isValid() || !validEncoding) {
             event->setError(Error::LowDifficulty);
         }
         else if (!telemetryJob) {
@@ -430,14 +763,50 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         else if (event->request.algorithm.isValid() && event->request.algorithm != telemetryJob->algorithm) {
             event->setError(Error::IncorrectAlgorithm);
         }
-        else if (event->request.actualDiff() < telemetryJob->minerDiff) {
+        else if (!rememberSubmission(event->request.jobId.data(), event->request.nonce)) {
+            event->setError(Error::DuplicateShare);
+        }
+        else if (!verifier && event->request.actualDiff() < telemetryJob->minerDiff) {
             event->setError(Error::LowDifficulty);
         }
         else if (hasExtension(EXT_NICEHASH) && !event->request.isCompatible(m_fixedByte)) {
             event->setError(Error::InvalidNonce);
         }
 
+        if (event->error() == Error::NoError && verifier && claimedCandidate &&
+            !verifier->allowCandidate(m_key)) {
+            event->setError(Error::CandidateRateLimit);
+        }
+
+        if (event->error() == Error::NoError && verifier && !claimedCandidate) {
+            if (startVerification(event, *telemetryJob)) {
+                // The verifier request owns all share fields. SubmitEvent uses
+                // the process-wide placement buffer and cannot survive the
+                // asynchronous Unix-socket round trip.
+                event->~SubmitEvent();
+                return true;
+            }
+
+            LiveEventStream::Row verifyError("verify_error");
+            verifyError.minerId = m_id;
+            verifyError.mapperId = m_mapperId;
+            verifyError.sourceId = event->request.templateSourceId;
+            verifyError.templateId = std::to_string(event->request.templateGeneration);
+            verifyError.height = event->request.height;
+            verifyError.seedHash = telemetryJob->seedHash.data() ? telemetryJob->seedHash.data() : "";
+            verifyError.jobId = event->request.jobId.data() ? event->request.jobId.data() : "";
+            verifyError.shareId = event->request.shareId;
+            verifyError.minerRequestId = event->request.id;
+            verifyError.nonce = event->request.nonce ? event->request.nonce : "";
+            verifyError.resultHash = event->request.result ? event->request.result : "";
+            verifyError.status = "unavailable";
+            verifyError.errorMessage = "verifier not ready, seed not ready, or queue full";
+            LiveEventStream::publish(verifyError);
+            event->setError(Error::VerificationFailed);
+        }
+
         if (event->error() == Error::NoError &&
+            !verifier &&
             event->request.minerDiff < event->request.networkDiff &&
             event->request.actualDiff() < event->request.networkDiff) {
             success(id, "OK");
@@ -458,6 +827,7 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
 
         if (!event->start()) {
             replyWithError(id, Error::toString(finalError));
+            recordShareOutcome(false);
         }
 
         return finalError != Error::InvalidNonce;

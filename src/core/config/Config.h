@@ -65,12 +65,19 @@ public:
     inline const BindHosts &bind() const           { return m_bind; }
     inline const String &accessLog() const         { return m_accessLog; }
     inline const String &eventStreamPath() const   { return m_eventStreamPath; }
+    inline const String &randomXVerifierPath() const { return m_randomXVerifierPath; }
     inline const String &password() const          { return m_password; }
     inline bool isEventStreamEnabled() const       { return m_eventStreamEnabled; }
+    inline bool isRandomXVerifierEnabled() const   { return m_randomXVerifierEnabled; }
     inline int mode() const                        { return m_mode; }
     inline int reuseTimeout() const                { return m_reuseTimeout; }
     inline static IConfig *create()                { return new Config(); }
     inline uint64_t diff() const                   { return m_diff; }
+    inline uint32_t randomXVerifierCandidateLimit() const { return m_randomXVerifierCandidateLimit; }
+    inline uint32_t randomXVerifierMaxQueue() const { return m_randomXVerifierMaxQueue; }
+    inline uint32_t randomXVerifierMaxPendingPerMiner() const { return m_randomXVerifierMaxPendingPerMiner; }
+    inline uint32_t randomXVerifierMaxConsecutiveRejections() const { return m_randomXVerifierMaxConsecutiveRejections; }
+    inline uint64_t randomXVerifierTimeout() const { return m_randomXVerifierTimeout; }
     inline Workers::Mode workersMode() const       { return m_workersMode; }
 
 private:
@@ -83,12 +90,19 @@ private:
     bool m_customDiffStats      = false;
     bool m_debug                = false;
     bool m_eventStreamEnabled   = false;
+    bool m_randomXVerifierEnabled = false;
     int m_mode                  = NICEHASH_MODE;
     int m_reuseTimeout          = 0;
     String m_accessLog;
     String m_eventStreamPath    = "/run/xmrig-proxy/events.sock";
+    String m_randomXVerifierPath = "/run/xmrig-randomx-verifier/verifier.sock";
     String m_password;
     uint64_t m_diff             = 0;
+    uint64_t m_randomXVerifierTimeout = 5000;
+    uint32_t m_randomXVerifierMaxQueue = 256;
+    uint32_t m_randomXVerifierMaxPendingPerMiner = 8;
+    uint32_t m_randomXVerifierMaxConsecutiveRejections = 8;
+    uint32_t m_randomXVerifierCandidateLimit = 12;
     Workers::Mode m_workersMode = Workers::RigID;
 };
 

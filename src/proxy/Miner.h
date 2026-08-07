@@ -28,6 +28,9 @@
 #include <algorithm>
 #include <bitset>
 #include <deque>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <uv.h>
 
 #include "3rdparty/rapidjson/fwd.h"
@@ -37,6 +40,8 @@
 #include "base/net/tools/Storage.h"
 #include "base/tools/Object.h"
 #include "base/tools/String.h"
+#include "proxy/Error.h"
+#include "proxy/RandomXVerifier.h"
 
 
 using BIO = struct bio_st;
@@ -46,6 +51,7 @@ namespace xmrig {
 
 
 class Job;
+class SubmitEvent;
 class TlsContext;
 
 
@@ -72,9 +78,14 @@ public:
     ~Miner() override;
 
     bool accept(uv_stream_t *server);
-    inline void clearTelemetryJobs()                           { m_telemetryJobs.clear(); }
+    inline void clearTelemetryJobs()
+    {
+        m_telemetryJobs.clear();
+        ++m_verificationGeneration;
+    }
     void forwardJob(const Job &job, const char *algo);
     void replyWithError(int64_t id, const char *message);
+    void recordShareOutcome(bool accepted);
     void setJob(Job &job, int64_t extra_nonce = -1);
     void success(int64_t id, const char *status);
 
@@ -118,23 +129,67 @@ private:
     {
         Algorithm algorithm;
         String entropy;
+        String hashingBlob;
         String id;
+        String seedHash;
+        String signatureData;
         uint64_t height = 0;
         uint64_t issuedAt = 0;
         uint64_t minerDiff = 0;
         uint64_t networkDiff = 0;
+        uint64_t issuanceToken = 0;
         uint64_t templateGeneration = 0;
         uint64_t templateSourceId = 0;
+        size_t nonceOffset = 0;
+        uint8_t viewTag = 0;
+        int64_t extraNonce = -1;
+    };
+
+    struct PendingShare
+    {
+        Algorithm algorithm;
+        int64_t mapperId = -1;
+        int64_t requestId = 0;
+        int64_t extraNonce = -1;
+        uint8_t viewTag = 0;
+        uint64_t shareId = 0;
+        uint64_t height = 0;
+        uint64_t minerDiff = 0;
+        uint64_t networkDiff = 0;
+        uint64_t issuanceToken = 0;
+        uint64_t verificationGeneration = 0;
+        uint64_t templateGeneration = 0;
+        uint64_t templateSourceId = 0;
+        std::string jobId;
+        std::string nonce;
+        std::string claimedHash;
+        std::string hashingBlob;
+        std::string seedHash;
+        std::string signature;
+        std::string signatureData;
+        std::string commitment;
+        std::string entropy;
+    };
+
+    struct SeenSubmission
+    {
+        std::string key;
+        uint64_t seenAt = 0;
     };
 
     constexpr static size_t kLoginTimeout  = 10 * 1000;
     constexpr static size_t kSocketTimeout = 60 * 10 * 1000;
 
     bool isWritable() const;
+    bool rememberSubmission(const char *jobId, const char *nonce);
+    bool startVerification(SubmitEvent *event, const TelemetryJob &job);
+    void completeVerification(const std::shared_ptr<PendingShare> &share, const RandomXVerifier::Result &result);
+    void fillSubmitMetadata(SubmitEvent *event, const PendingShare &share) const;
     bool writeRaw(const char *data, size_t size);
     const TelemetryJob *findTelemetryJob(const String &id) const;
     bool parseRequest(int64_t id, const char *method, const rapidjson::Value &params);
-    void rememberJob(const Job &job);
+    void rememberJob(const Job &job, const char *hashingBlob);
+    void rejectPendingShare(const PendingShare &share, Error::Code error);
     bool send(BIO *bio);
     void heartbeat();
     void parse(char *line, size_t len);
@@ -172,6 +227,8 @@ private:
     String m_user;
     String m_signatureData;
     std::deque<TelemetryJob> m_telemetryJobs;
+    std::deque<SeenSubmission> m_seenSubmissions;
+    std::unordered_map<std::string, uint64_t> m_seenSubmissionTimes;
     uint8_t m_viewTag       = 0;
     Tls *m_tls              = nullptr;
     uint16_t m_localPort;
@@ -181,8 +238,11 @@ private:
     uint64_t m_expire;
     uint64_t m_rx           = 0;
     uint64_t m_timestamp;
+    uint64_t m_jobIssuanceSequence = 0;
     uint64_t m_templateGeneration = 0;
     uint64_t m_tx           = 0;
+    uint64_t m_verificationGeneration = 0;
+    uint32_t m_consecutiveShareRejections = 0;
     uint8_t m_fixedByte     = 0;
     int64_t m_extraNonce    = -1;
     uintptr_t m_key;

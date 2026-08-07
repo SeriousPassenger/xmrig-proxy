@@ -50,6 +50,7 @@ set(HEADERS
     src/proxy/Miners.h
     src/proxy/Proxy.h
     src/proxy/ProxyDebug.h
+    src/proxy/RandomXVerifier.h
     src/proxy/Server.h
     src/proxy/splitters/donate/DonateMapper.h
     src/proxy/splitters/donate/DonateSplitter.h
@@ -96,6 +97,7 @@ set(SOURCES
     src/proxy/Miners.cpp
     src/proxy/Proxy.cpp
     src/proxy/ProxyDebug.cpp
+    src/proxy/RandomXVerifier.cpp
     src/proxy/Server.cpp
     src/proxy/splitters/donate/DonateMapper.cpp
     src/proxy/splitters/donate/DonateSplitter.cpp

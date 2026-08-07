@@ -56,7 +56,7 @@ protected:
     inline int64_t send(const rapidjson::Value &, Callback) override { return -1; }
     inline int64_t send(const rapidjson::Value &) override           { return -1; }
     void deleteLater() override;
-    inline void tick(uint64_t) override                              {}
+    void tick(uint64_t) override;
 
 private:
     struct JobContext
@@ -90,6 +90,7 @@ private:
     Coin m_coin;
     std::deque<JobContext> m_contexts;
     std::shared_ptr<IHttpListener> m_httpListener;
+    std::shared_ptr<const DaemonTemplateSource::Snapshot> m_pendingSnapshot;
     DaemonTemplateSource::Ptr m_source;
     String m_tlsFingerprint;
     String m_tlsVersion;

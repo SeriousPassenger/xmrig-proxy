@@ -960,8 +960,8 @@ HTML = r'''<!doctype html>
   </section>
 
   <section class="panel">
-    <div class="panel-head"><div><h2 id="topTitle">Top 5 observed accepted shares</h2><div class="sub">Ranked by miner-reported share difficulty; times are exact event times</div></div><span id="topCompleteness" class="badge">observed window</span></div>
-    <div class="scroll top-scroll"><table><thead><tr><th>#</th><th>Time (browser local)</th><th>Reported difficulty</th><th>Miner</th><th>Worker</th><th>Height</th><th>Result</th></tr></thead><tbody id="topBody"></tbody></table><div id="topEmpty" class="empty">No accepted shares observed yet.</div></div>
+    <div class="panel-head"><div><h2 id="topTitle">Top 5 observed accepted shares</h2><div class="sub">Ranked by accepted share difficulty; verifier-computed when enabled; times are exact event times</div></div><span id="topCompleteness" class="badge">observed window</span></div>
+    <div class="scroll top-scroll"><table><thead><tr><th>#</th><th>Time (browser local)</th><th>Share difficulty</th><th>Miner</th><th>Worker</th><th>Height</th><th>Result</th></tr></thead><tbody id="topBody"></tbody></table><div id="topEmpty" class="empty">No accepted shares observed yet.</div></div>
   </section>
 
   <section class="workspace" style="margin-top:10px">
@@ -973,7 +973,7 @@ HTML = r'''<!doctype html>
         <button id="pause">Pause view</button><button id="clear">Clear view</button>
         <label class="check"><input id="follow" type="checkbox" checked> follow</label>
       </div>
-      <div id="eventsScroll" class="scroll events-scroll"><table><thead><tr><th>Time (local)</th><th>Event</th><th>Miner</th><th>Source/template</th><th>Height</th><th>Reported diff</th><th>Status</th><th>Details</th></tr></thead><tbody id="eventsBody"></tbody></table></div>
+      <div id="eventsScroll" class="scroll events-scroll"><table><thead><tr><th>Time (local)</th><th>Event</th><th>Miner</th><th>Source/template</th><th>Height</th><th>Share diff</th><th>Status</th><th>Details</th></tr></thead><tbody id="eventsBody"></tbody></table></div>
     </div>
     <aside class="panel details"><div class="panel-head"><h2>Selected event</h2><button id="closeDetails">Clear</button></div><pre id="details">Select a timeline row to inspect every field.</pre></aside>
   </section>
@@ -986,11 +986,11 @@ HTML = r'''<!doctype html>
   const $ = id => document.getElementById(id);
   const nf = new Intl.NumberFormat('en-US');
   const groups = {
-    shares: e => e.startsWith('share_'),
+    shares: e => e.startsWith('share_') || e.startsWith('verify_'),
     blocks: e => e.startsWith('submit_block'),
-    templates: e => e.includes('template') || e.startsWith('daemon_height') || e === 'zmq_new_block',
+    templates: e => e.includes('template') || e.startsWith('daemon_height') || e.startsWith('verifier_seed_') || e === 'zmq_new_block',
     workers: e => e.startsWith('worker_'),
-    errors: (e, r) => e.includes('error') || ['error','fatal','degraded','warning','rejected','rejected_local','rejected_upstream'].includes(r.status)
+    errors: (e, r) => e.includes('error') || e === 'verify_mismatch' || ['error','fatal','degraded','warning','mismatch','rejected','rejected_local','rejected_upstream'].includes(r.status)
   };
   const missing = value => value === null || value === undefined || value === '';
   const exact = value => { if (missing(value)) return '—'; try { return BigInt(value).toLocaleString('en-US'); } catch (_) { return String(value); } };
@@ -998,7 +998,7 @@ HTML = r'''<!doctype html>
   const time = value => { if (!value) return '—'; const d=new Date(value); return Number.isNaN(d.valueOf())?value:d.toLocaleString(undefined,{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',fractionalSecondDigits:3,hour12:false}); };
   const short = value => value && value.length > 12 ? `${value.slice(0,8)}…` : (value || '—');
   const td = (tr, value, cls='') => { const cell=document.createElement('td'); cell.textContent=value; if(cls) cell.className=cls; tr.appendChild(cell); return cell; };
-  const eventClass = event => event.startsWith('submit_block')?'event-block':event.startsWith('worker_')?'event-worker':(event.includes('template')||event==='zmq_new_block')?'event-template':'';
+  const eventClass = event => event.startsWith('submit_block')?'event-block':event.startsWith('worker_')?'event-worker':(event.includes('template')||event.startsWith('verifier_seed_')||event==='zmq_new_block')?'event-template':'';
   const statusClass = status => `status-${status || 'none'}`;
   const detailText = row => {
     const parts=[];
@@ -1251,7 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("socket", nargs="?", default=DEFAULT_SOCKET, help=f"Unix socket path (default: {DEFAULT_SOCKET})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"localhost HTTP port (default: {DEFAULT_PORT})")
     parser.add_argument("--max-events", type=int, default=5000, metavar="N", help="bounded timeline rows kept in memory (default: 5000)")
-    parser.add_argument("--top-shares", type=int, default=5, metavar="N", help="accepted shares ranked by reported difficulty (default: 5)")
+    parser.add_argument("--top-shares", type=int, default=5, metavar="N", help="accepted shares ranked by share difficulty (verifier-computed when enabled; default: 5)")
     parser.add_argument("--retry-cap", type=float, default=5.0, metavar="SECONDS", help="maximum socket reconnect delay (default: 5)")
     parser.add_argument("--api-url", metavar="URL", help="optional loopback XMRig Proxy API base URL, for example http://127.0.0.1:8080")
     parser.add_argument("--api-token-env", default="XMRIG_PROXY_API_TOKEN", metavar="NAME", help="environment variable holding the API token (default: XMRIG_PROXY_API_TOKEN)")

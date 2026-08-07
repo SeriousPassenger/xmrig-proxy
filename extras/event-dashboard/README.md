@@ -8,10 +8,11 @@ The dashboard provides:
 
 - a bounded live event timeline with search, category filters, pause/follow,
   and full row details;
-- daemon template-source height, age, refresh reason, and error state;
+- daemon template-source height, age, refresh reason, error state, and
+  process-global RandomX verifier seed lifecycle;
 - worker connection, job, share, and block-submission events;
 - the top five observed accepted shares with their exact event times and
-  miner-reported difficulties;
+  accepted share difficulties (independently verifier-computed when enabled);
 - optional XMRig Proxy HTTP API hashrate, result, resource, upstream, and
   per-worker statistics.
 

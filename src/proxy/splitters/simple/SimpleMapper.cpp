@@ -231,6 +231,8 @@ void xmrig::SimpleMapper::onResultAccepted(IStrategy *, IClient *client, const S
     else {
         m_miner->success(result.reqId, "OK");
     }
+
+    m_miner->recordShareOutcome(error == nullptr);
 }
 
 

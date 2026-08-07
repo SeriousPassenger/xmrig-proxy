@@ -23,6 +23,7 @@
  */
 
 
+#include <cinttypes>
 #include <cstdio>
 #include <uv.h>
 
@@ -60,6 +61,20 @@ static void print_bind(xmrig::Controller *controller)
 }
 
 
+static void print_verifier(xmrig::Controller *controller)
+{
+    if (!controller->config()->isRandomXVerifierEnabled()) {
+        return;
+    }
+
+    Log::print(GREEN_BOLD(" * ") WHITE_BOLD("%-13s") CYAN("%s") " queue=%u per-miner=%u timeout=%" PRIu64 "ms",
+               "RX VERIFIER", controller->config()->randomXVerifierPath().data(),
+               controller->config()->randomXVerifierMaxQueue(),
+               controller->config()->randomXVerifierMaxPendingPerMiner(),
+               controller->config()->randomXVerifierTimeout());
+}
+
+
 static void print_commands(xmrig::Controller *)
 {
     if (Log::isColors()) {
@@ -83,5 +98,6 @@ void Summary::print(xmrig::Controller *controller)
     print_mode(controller);
     controller->config()->pools().print();
     print_bind(controller);
+    print_verifier(controller);
     print_commands(controller);
 }
