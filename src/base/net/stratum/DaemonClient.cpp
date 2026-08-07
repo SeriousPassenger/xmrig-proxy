@@ -72,47 +72,119 @@ namespace xmrig {
     static const char *kHeight                  = "height";
     static const char *kJsonRPC                 = "/json_rpc";
 
-
     // DaemonClient3 extra_nonce layout:
     //
     //   [0..3]    = mutable proxy/NiceHash extra nonce, overwritten on submit
-    //   [4..19]   = preserved per-template random entropy
-    //   [20..31]  = fixed ASCII marker "/Heathcliff/"
+    //   [4..7]    = fixed observer instanceId, used by blocks.p2pool.observer Unknown(<id>)
+    //   [8..23]   = preserved per-template random entropy
+    //   [24..42]  = fixed ASCII marker "@https://xmr.tokyo/"
+    //   [43]      = 1-byte observer display pad
     //
     // Serialized tx_extra shape:
     //
-    //   02 20 [4 mutable bytes] [16 preserved random bytes] 2f4865617468636c6966662f
+    //   02 2c [4 mutable bytes] [4 observer instanceId bytes] [16 preserved random bytes] 4068747470733a2f2f786d722e746f6b796f2f 00
     //
-    // 0x20 = 32-byte extra_nonce payload.
+    // 0x2c = 44-byte extra_nonce payload.
+    //
+    // Observer should render the marker tail as a complete 4-byte word:
+    //
+    //   40687474 offset6
+    //   70733a2f offset7
+    //   2f786d72 offset8
+    //   2e746f6b offset9
+    //   796f2f00 offset10
     //
     // This keeps the first 4 bytes compatible with XMRig-proxy / NiceHash style
-    // submit mutation while preserving 16 bytes of template-level uniqueness.
+    // submit mutation, makes bytes [4..7] stable for observer grouping, preserves
+    // the old 16 bytes of template-level random uniqueness, and adds only one
+    // zero byte at the end for 4-byte observer display alignment.
     static constexpr size_t kMutableExtraNonceSize    = 4;
-    static constexpr size_t kPerTemplateRandomSize    = 16;
-    static constexpr char kExtraNonceMarkerHex[]      = "2f4865617468636c6966662f"; // "/Heathcliff/"
 
+    // Change only this value later if you want a different observer grouping ID.
+    static constexpr char kObserverInstanceIdHex[]    = "bcb7cceb";
+
+    static constexpr size_t kPerTemplateRandomSize    = 16;
+    static constexpr char kExtraNonceMarkerHex[]      = "4068747470733a2f2f786d722e746f6b796f2f"; // "@https://xmr.tokyo/"
+    static constexpr char kObserverDisplayPadHex[]    = "00"; // 1-byte pad so observer renders offset10
+
+    static constexpr size_t kObserverInstanceIdSize   = (sizeof(kObserverInstanceIdHex) - 1) / 2;
     static constexpr size_t kExtraNonceMarkerSize     = (sizeof(kExtraNonceMarkerHex) - 1) / 2;
-    static constexpr size_t kMarkerOffsetBytes        = kMutableExtraNonceSize + kPerTemplateRandomSize;
-    static constexpr size_t kBlobReserveSize          = kMarkerOffsetBytes + kExtraNonceMarkerSize;
+    static constexpr size_t kObserverDisplayPadSize   = (sizeof(kObserverDisplayPadHex) - 1) / 2;
+
+    static constexpr size_t kObserverInstanceIdOffsetBytes  = kMutableExtraNonceSize;
+    static constexpr size_t kPerTemplateRandomOffsetBytes   = kObserverInstanceIdOffsetBytes + kObserverInstanceIdSize;
+    static constexpr size_t kMarkerOffsetBytes              = kPerTemplateRandomOffsetBytes + kPerTemplateRandomSize;
+    static constexpr size_t kObserverDisplayPadOffsetBytes  = kMarkerOffsetBytes + kExtraNonceMarkerSize;
+    static constexpr size_t kBlobReserveSize                = kObserverDisplayPadOffsetBytes + kObserverDisplayPadSize;
 
     static_assert(
-        (sizeof(kExtraNonceMarkerHex) - 1) % 2 == 0,
-                  "extra_nonce marker hex must have an even number of characters"
+        (sizeof(kObserverInstanceIdHex) - 1) % 2 == 0,
+        "observer instanceId hex must have an even number of characters"
     );
 
     static_assert(
-        kExtraNonceMarkerSize == 12,
+        kObserverInstanceIdSize == 4,
+        "observer instanceId must be exactly 4 bytes"
+    );
+
+    static_assert(
+        (sizeof(kExtraNonceMarkerHex) - 1) % 2 == 0,
+        "extra_nonce marker hex must have an even number of characters"
+    );
+
+    static_assert(
+        kExtraNonceMarkerSize == 19,
         "unexpected extra_nonce marker size"
     );
 
     static_assert(
-        kBlobReserveSize == 32,
-        "DaemonClient3 expected a 32-byte extra_nonce payload"
+        (sizeof(kObserverDisplayPadHex) - 1) % 2 == 0,
+        "observer display pad hex must have an even number of characters"
     );
 
     static_assert(
-        kMarkerOffsetBytes + kExtraNonceMarkerSize == kBlobReserveSize,
-        "extra_nonce marker must end exactly at the end of the payload"
+        kObserverDisplayPadSize == 1,
+        "observer display pad must be exactly 1 byte"
+    );
+
+    static_assert(
+        kObserverInstanceIdOffsetBytes == 4,
+        "observer instanceId must start at byte offset 4"
+    );
+
+    static_assert(
+        kPerTemplateRandomSize == 16,
+        "expected to preserve 16 bytes of per-template random entropy"
+    );
+
+    static_assert(
+        kMarkerOffsetBytes == 24,
+        "extra_nonce marker must start at byte offset 24"
+    );
+
+    static_assert(
+        kObserverDisplayPadOffsetBytes == 43,
+        "observer display pad must start at byte offset 43"
+    );
+
+    static_assert(
+        kBlobReserveSize == 44,
+        "DaemonClient3 expected a 44-byte extra_nonce payload"
+    );
+
+    static_assert(
+        kMarkerOffsetBytes + kExtraNonceMarkerSize == kObserverDisplayPadOffsetBytes,
+        "extra_nonce marker must end immediately before the observer display pad"
+    );
+
+    static_assert(
+        kObserverDisplayPadOffsetBytes + kObserverDisplayPadSize == kBlobReserveSize,
+        "observer display pad must end exactly at the end of the payload"
+    );
+
+    static_assert(
+        kBlobReserveSize % 4 == 0,
+        "extra_nonce payload should end on a 4-byte observer display boundary"
     );
 
     static_assert(
@@ -626,18 +698,32 @@ int64_t xmrig::DaemonClient::getBlockTemplate()
     // DaemonClient3 layout:
     //
     //   [0..3]    = mutable proxy/NiceHash extra nonce, overwritten on submit
-    //   [4..19]   = preserved random per-template entropy
-    //   [20..31]  = fixed ASCII marker "/Heathcliff/"
+    //   [4..7]    = fixed observer instanceId
+    //   [8..23]   = preserved random per-template entropy
+    //   [24..42]  = fixed ASCII marker "@https://xmr.tokyo/"
+    //   [43]      = 1-byte observer display pad
     //
     // Serialized tx_extra extra_nonce payload:
     //
-    //   02 20 [4 mutable bytes] [16 random bytes] 2f4865617468636c6966662f
+    //   02 2c [4 mutable bytes] [4 observer instanceId bytes] [16 random bytes] 4068747470733a2f2f786d722e746f6b796f2f 00
     //
     // All offsets are byte offsets. extraNonce is hex-encoded, so multiply by 2.
     memcpy(
+        extraNonce.data() + kObserverInstanceIdOffsetBytes * 2,
+        kObserverInstanceIdHex,
+        sizeof(kObserverInstanceIdHex) - 1
+    );
+
+    memcpy(
         extraNonce.data() + kMarkerOffsetBytes * 2,
-           kExtraNonceMarkerHex,
-           sizeof(kExtraNonceMarkerHex) - 1
+        kExtraNonceMarkerHex,
+        sizeof(kExtraNonceMarkerHex) - 1
+    );
+
+    memcpy(
+        extraNonce.data() + kObserverDisplayPadOffsetBytes * 2,
+        kObserverDisplayPadHex,
+        sizeof(kObserverDisplayPadHex) - 1
     );
 
     params.AddMember("extra_nonce", extraNonce.toJSON(doc), allocator);

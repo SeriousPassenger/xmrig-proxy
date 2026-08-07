@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(xmrig-proxy)
+project(xmrig-proxy-marker)
 
 
 option(WITH_GOOGLE_BREAKPAD "Use Google Breakpad"     OFF)
