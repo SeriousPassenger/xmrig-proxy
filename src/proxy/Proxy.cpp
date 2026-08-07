@@ -44,6 +44,7 @@
 #include "proxy/Events.h"
 #include "proxy/events/ConnectionEvent.h"
 #include "proxy/Login.h"
+#include "proxy/live/LiveEventStream.h"
 #include "proxy/Miner.h"
 #include "proxy/Miners.h"
 #include "proxy/ProxyDebug.h"
@@ -54,6 +55,11 @@
 #include "proxy/splitters/simple/SimpleSplitter.h"
 #include "proxy/Stats.h"
 #include "proxy/workers/Workers.h"
+
+
+#ifdef XMRIG_FEATURE_HTTP
+#   include "base/net/stratum/DaemonTemplateSource.h"
+#endif
 
 
 #ifdef XMRIG_FEATURE_TLS
@@ -96,6 +102,14 @@ xmrig::Proxy::Proxy(Controller *controller) :
     m_accessLog = new AccessLog(controller);
     m_workers   = new Workers(controller);
 
+    if (controller->config()->isEventStreamEnabled()) {
+        m_eventStream = new LiveEventStream(controller->config()->eventStreamPath().data());
+
+#       ifdef XMRIG_FEATURE_HTTP
+        DaemonTemplateSource::setObserver(m_eventStream);
+#       endif
+    }
+
     m_timer = new Timer(this);
 
 #   ifdef XMRIG_FEATURE_API
@@ -132,6 +146,16 @@ xmrig::Proxy::Proxy(Controller *controller) :
 
     m_debug = new ProxyDebug(controller->config()->isDebug());
 
+    if (m_eventStream) {
+        // Keep telemetry last so it sees the mapper, custom-difficulty and
+        // final accepted/rejected state produced by the normal listeners.
+        Events::subscribe(IEvent::ConnectionType, m_eventStream);
+        Events::subscribe(IEvent::CloseType, m_eventStream);
+        Events::subscribe(IEvent::LoginType, m_eventStream);
+        Events::subscribe(IEvent::SubmitType, m_eventStream);
+        Events::subscribe(IEvent::AcceptType, m_eventStream);
+    }
+
     controller->addListener(this);
 }
 
@@ -139,6 +163,11 @@ xmrig::Proxy::Proxy(Controller *controller) :
 xmrig::Proxy::~Proxy()
 {
     Events::stop();
+
+#   ifdef XMRIG_FEATURE_HTTP
+    DaemonTemplateSource::setObserver(nullptr);
+    DaemonTemplateSource::shutdownAll();
+#   endif
 
     delete m_timer;
 
@@ -159,6 +188,7 @@ xmrig::Proxy::~Proxy()
     delete m_accessLog;
     delete m_debug;
     delete m_workers;
+    delete m_eventStream;
 
 #   ifdef XMRIG_FEATURE_TLS
     delete m_tls;
@@ -171,6 +201,10 @@ void xmrig::Proxy::connect()
 #   ifdef XMRIG_FEATURE_TLS
     m_tls = TlsContext::create(m_controller->config()->tls());
 #   endif
+
+    if (m_eventStream && !m_eventStream->start()) {
+        LOG_ERR("Failed to start local event stream at \"%s\"", m_eventStream->path().c_str());
+    }
 
     m_splitter->connect();
 

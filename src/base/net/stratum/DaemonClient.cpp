@@ -1,126 +1,95 @@
 /* XMRig
- * Copyright (c) 2010      Jeff Garzik <jgarzik@pobox.com>
- * Copyright (c) 2012-2014 pooler      <pooler@litecoinpool.org>
- * Copyright (c) 2014      Lucas Jones <https://github.com/lucasjones>
- * Copyright (c) 2014-2016 Wolf9466    <https://github.com/OhGodAPet>
- * Copyright (c) 2016      Jay D Dee   <jayddee246@gmail.com>
- * Copyright (c) 2017-2018 XMR-Stak    <https://github.com/fireice-uk>, <https://github.com/psychocrypt>
  * Copyright (c) 2019      Howard Chu  <https://github.com/hyc>
- * Copyright (c) 2018-2023 SChernykh   <https://github.com/SChernykh>
- * Copyright (c) 2016-2023 XMRig       <https://github.com/xmrig>, <support@xmrig.com>
+ * Copyright (c) 2018-2026 SChernykh   <https://github.com/SChernykh>
+ * Copyright (c) 2016-2026 XMRig       <https://github.com/xmrig>, <support@xmrig.com>
  *
- *   This program is free software: you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation, either version 3 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  */
-
-#include <uv.h>
 
 
 #include "base/net/stratum/DaemonClient.h"
+
 #include "3rdparty/rapidjson/document.h"
 #include "3rdparty/rapidjson/error/en.h"
 #include "base/io/json/Json.h"
 #include "base/io/json/JsonRequest.h"
 #include "base/io/log/Log.h"
 #include "base/kernel/interfaces/IClientListener.h"
-#include "base/kernel/Platform.h"
-#include "base/net/dns/Dns.h"
-#include "base/net/dns/DnsRecords.h"
 #include "base/net/http/Fetch.h"
 #include "base/net/http/HttpData.h"
 #include "base/net/http/HttpListener.h"
 #include "base/net/stratum/SubmitResult.h"
-#include "base/net/tools/NetBuffer.h"
-#include "base/tools/bswap_64.h"
+#include "base/tools/Chrono.h"
+#include "base/tools/cryptonote/BlockTemplate.h"
 #include "base/tools/cryptonote/Signatures.h"
 #include "base/tools/Cvt.h"
-#include "base/tools/Timer.h"
+#include "base/tools/SecureRandom.h"
 #include "net/JobResult.h"
-
-
-#ifdef XMRIG_FEATURE_TLS
-#include <openssl/ssl.h>
-#endif
+#include "proxy/live/LiveEventStream.h"
 
 
 #include <algorithm>
-#include <cassert>
-#include <random>
+#include <cstring>
+#include <string>
 
 
 namespace xmrig {
 
 
-Storage<DaemonClient> DaemonClient::m_storage;
+namespace {
 
 
-static const char* kBlocktemplateBlob       = "blocktemplate_blob";
-static const char* kBlockhashingBlob        = "blockhashing_blob";
-static const char *kGetHeight               = "/getheight";
-static const char *kGetInfo                 = "/getinfo";
-static const char *kHash                    = "hash";
-static const char *kHeight                  = "height";
-static const char *kJsonRPC                 = "/json_rpc";
-
-static constexpr size_t kBlobReserveSize    = 8;
-
-static const char kZMQGreeting[64] = { static_cast<char>(-1), 0, 0, 0, 0, 0, 0, 0, 0, 127, 3, 0, 'N', 'U', 'L', 'L' };
-static constexpr size_t kZMQGreetingSize1 = 11;
-
-static const char kZMQHandshake[] = "\4\x19\5READY\xbSocket-Type\0\0\0\3SUB";
-static const char kZMQSubscribe[] = "\0\x18\1json-minimal-chain_main";
-
-} // namespace xmrig
+static const char *kJsonRpc = "/json_rpc";
+static const char *kSubmitTag = "daemon-submit";
+static constexpr size_t kEntropySize = 16;
+static constexpr size_t kJobHistorySize = 6;
+static constexpr uint64_t kJobHistoryMs = 120000;
+static const int kHttpSubmit = 0x445403;
 
 
-xmrig::DaemonClient::DaemonClient(int id, IClientListener *listener) :
-    BaseClient(id, listener)
+} // namespace
+
+
+DaemonClient::DaemonClient(int id, IClientListener *listener) :
+    BaseClient(id, listener),
+    m_httpListener(std::make_shared<HttpListener>(this))
 {
-    m_httpListener  = std::make_shared<HttpListener>(this);
-    m_timer         = new Timer(this);
-    m_key           = m_storage.add(this);
 }
 
 
-xmrig::DaemonClient::~DaemonClient()
+DaemonClient::~DaemonClient()
 {
-    delete m_timer;
-    delete m_ZMQSocket;
+    disconnect();
 }
 
 
-void xmrig::DaemonClient::deleteLater()
+void DaemonClient::deleteLater()
 {
-    if (m_pool.zmq_port() >= 0) {
-        ZMQClose(true);
-    }
-    else {
-        delete this;
-    }
+    delete this;
 }
 
 
-bool xmrig::DaemonClient::disconnect()
+bool DaemonClient::disconnect()
 {
-    if (m_state != UnconnectedState) {
-        setState(UnconnectedState);
+    if (m_source) {
+        m_source->unsubscribe(this);
+        m_source.reset();
     }
+
+    m_contexts.clear();
+    m_results.clear();
+    m_httpListener.reset();
+    m_job.reset();
+    setState(UnconnectedState);
 
     return true;
 }
 
 
-bool xmrig::DaemonClient::isTLS() const
+bool DaemonClient::isTLS() const
 {
 #   ifdef XMRIG_FEATURE_TLS
     return m_pool.isTLS();
@@ -130,58 +99,346 @@ bool xmrig::DaemonClient::isTLS() const
 }
 
 
-int64_t xmrig::DaemonClient::submit(const JobResult &result)
+void DaemonClient::connect()
 {
-    if (result.jobId != m_currentJobId) {
+    if (m_state == ConnectedState || m_state == ConnectingState) {
+        return;
+    }
+
+    setState(ConnectingState);
+
+    if (!m_httpListener) {
+        m_httpListener = std::make_shared<HttpListener>(this);
+    }
+
+    if (!m_coin.isValid() && !m_pool.algorithm().isValid()) {
+        LOG_ERR("%s " RED("connect error: ") RED_BOLD("\"Invalid algorithm.\""), tag());
+        m_listener->onClose(this, 1);
+        return;
+    }
+
+    if (!m_pool.algorithm().isValid()) {
+        m_pool.setAlgo(m_coin.algorithm());
+    }
+
+    if (!m_walletAddress.isValid()) {
+        LOG_ERR("%s " RED("connect error: ") RED_BOLD("\"Invalid wallet address.\""), tag());
+        m_listener->onClose(this, 1);
+        return;
+    }
+
+    m_source = DaemonTemplateSource::acquire(m_pool, m_user);
+    if (!m_source) {
+        LOG_ERR("%s " RED("connect error: ") RED_BOLD("\"Failed to create daemon template source.\""), tag());
+        m_listener->onClose(this, 1);
+        return;
+    }
+
+    m_source->subscribe(this, true);
+}
+
+
+void DaemonClient::connect(const Pool &pool)
+{
+    setPool(pool);
+    connect();
+}
+
+
+void DaemonClient::setPool(const Pool &pool)
+{
+    BaseClient::setPool(pool);
+
+    m_walletAddress.decode(m_user);
+    m_coin = pool.coin().isValid() ? pool.coin() : m_walletAddress.coin();
+
+    if (!m_coin.isValid() && pool.algorithm() == Algorithm::RX_WOW) {
+        m_coin = Coin::WOWNERO;
+    }
+}
+
+
+void DaemonClient::onDaemonTemplate(const std::shared_ptr<const DaemonTemplateSource::Snapshot> &snapshot)
+{
+    if (m_state == UnconnectedState || !snapshot) {
+        return;
+    }
+
+    if (!installTemplate(snapshot) && !isQuiet()) {
+        LOG_ERR("%s " RED("job error: ") RED_BOLD("\"Unable to derive private 16-byte template job.\""), tag());
+    }
+}
+
+
+bool DaemonClient::prepareSpendKey(Job &job, const BlockTemplate &blocktemplate, const char **error)
+{
+    if (!blocktemplate.hasMinerSignature()) {
+        return true;
+    }
+
+    if (m_pool.spendSecretKey().isEmpty()) {
+        *error = "Secret spend key is not set.";
+        return false;
+    }
+
+    if (m_pool.spendSecretKey().size() != 64) {
+        *error = "Secret spend key must be exactly 64 hex characters.";
+        return false;
+    }
+
+    uint8_t secretSpendKey[32];
+    if (!Cvt::fromHex(secretSpendKey, sizeof(secretSpendKey), m_pool.spendSecretKey(), 64)) {
+        *error = "Secret spend key is not valid hexadecimal data.";
+        return false;
+    }
+
+    uint8_t publicSpendKey[32];
+    if (!secret_key_to_public_key(secretSpendKey, publicSpendKey)) {
+        *error = "Secret spend key is invalid.";
+        return false;
+    }
+
+    job.setSpendSecretKey(secretSpendKey);
+    return true;
+}
+
+
+bool DaemonClient::installTemplate(const std::shared_ptr<const DaemonTemplateSource::Snapshot> &snapshot)
+{
+    auto fail = [this](const char *message) {
+        if (!isQuiet()) {
+            LOG_ERR("%s " RED("job error: ") RED_BOLD("\"%s\""), tag(), message);
+        }
+        return false;
+    };
+
+    if (snapshot->reserveSize != kEntropySize || snapshot->blocktemplateBlob.isEmpty()) {
+        return fail("Daemon template does not contain the required 16-byte reserve.");
+    }
+
+    BlockTemplate original;
+    if (!original.parse(snapshot->blocktemplateBlob, m_coin)) {
+        return fail("Invalid block template received from daemon.");
+    }
+
+    if (m_coin == Coin::MONERO && Cvt::toHex(original.generateHashingBlob()) != snapshot->blockhashingBlob) {
+        return fail("Daemon blockhashing_blob does not match the parsed block template.");
+    }
+
+    const size_t extraNonceOffset = original.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET);
+    if (original.txExtraNonce().size() != kEntropySize ||
+        snapshot->reservedOffset != extraNonceOffset ||
+        extraNonceOffset + kEntropySize > original.size()) {
+        return fail("Daemon reserved_offset does not identify an exact 16-byte tx extra nonce.");
+    }
+
+    Buffer entropy;
+    if (!SecureRandom::bytes(kEntropySize, entropy)) {
+        return fail("OS CSPRNG failed while generating template entropy.");
+    }
+
+    const String entropyHex = Cvt::toHex(entropy);
+    String blocktemplate(snapshot->blocktemplateBlob);
+    memcpy(blocktemplate.data() + extraNonceOffset * 2, entropyHex.data(), entropyHex.size());
+
+    // Parse the mutated full block so its coinbase hash and Merkle root are
+    // recalculated from the exact 16 bytes that this downstream will mine.
+    BlockTemplate mutated;
+    if (!mutated.parse(blocktemplate, m_coin) ||
+        mutated.txExtraNonce().size() != kEntropySize ||
+        mutated.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) != extraNonceOffset) {
+        return fail("Mutated block template failed validation.");
+    }
+
+    const String hashingBlob = Cvt::toHex(mutated.generateHashingBlob());
+    const std::string clientIdText = std::to_string(m_id);
+    Job job(false, m_pool.algorithm(), String(clientIdText.c_str()));
+
+    const size_t prefix = mutated.offset(BlockTemplate::MINER_TX_PREFIX_OFFSET);
+    job.setMinerTx(
+        mutated.blob() + prefix,
+        mutated.blob() + mutated.offset(BlockTemplate::MINER_TX_PREFIX_END_OFFSET),
+        mutated.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET) - prefix,
+        mutated.offset(BlockTemplate::TX_PUBKEY_OFFSET) - prefix,
+        mutated.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) - prefix,
+        mutated.txExtraNonce().size(),
+        mutated.minerTxMerkleTreeBranch(),
+        mutated.minerTxMerkleTreePath(),
+        mutated.outputType() == 3
+    );
+
+    const char *spendKeyError = nullptr;
+    if (!prepareSpendKey(job, mutated, &spendKeyError)) {
+        return fail(spendKeyError);
+    }
+
+    if (m_coin.isValid()) {
+        job.setAlgorithm(m_coin.algorithm(mutated.majorVersion()));
+    }
+
+    if (!job.setBlob(hashingBlob)) {
+        return fail("Generated hashing blob is invalid.");
+    }
+
+    if (!job.setSeedHash(snapshot->seedHash)) {
+        return fail("Daemon template has an invalid seed hash.");
+    }
+
+    job.setHeight(snapshot->height);
+    job.setDiff(snapshot->difficulty);
+
+    String jobId;
+    for (size_t attempt = 0; attempt < 4; ++attempt) {
+        Buffer id;
+        if (!SecureRandom::bytes(kEntropySize, id)) {
+            return fail("OS CSPRNG failed while generating a private job id.");
+        }
+
+        jobId = Cvt::toHex(id);
+        if (!findContext(jobId)) {
+            break;
+        }
+        jobId = nullptr;
+    }
+
+    if (jobId.isEmpty() || !job.setId(jobId)) {
+        return fail("Unable to allocate a collision-free private job id.");
+    }
+
+    job.setTemplateMetadata(snapshot->generation, snapshot->fetchedSteadyMs, entropyHex);
+
+    JobContext context;
+    context.blocktemplate      = blocktemplate;
+    context.entropy            = entropyHex;
+    context.jobId              = jobId;
+    context.hasMinerSignature  = mutated.hasMinerSignature();
+    context.hasViewTag         = mutated.outputType() == 3;
+    context.ephPublicKeyOffset = mutated.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET);
+    context.extraNonceOffset   = extraNonceOffset;
+    context.nonceOffset        = job.nonceOffset();
+    context.nonceSize          = job.nonceSize();
+    context.signatureOffset    = job.nonceOffset() + job.nonceSize();
+    context.txPublicKeyOffset  = mutated.offset(BlockTemplate::TX_PUBKEY_OFFSET);
+    context.createdSteadyMs    = Chrono::steadyMSecs();
+    context.difficulty         = snapshot->difficulty;
+    context.generation         = snapshot->generation;
+    context.height             = snapshot->height;
+
+    m_contexts.push_front(std::move(context));
+    trimContexts();
+    m_job = std::move(job);
+    m_ip  = snapshot->ip;
+
+#   ifdef XMRIG_FEATURE_TLS
+    m_tlsFingerprint = snapshot->tlsFingerprint;
+    m_tlsVersion     = snapshot->tlsVersion;
+#   endif
+
+    if (m_state == ConnectingState) {
+        setState(ConnectedState);
+    }
+
+    rapidjson::Value params(rapidjson::kNullType);
+    m_listener->onJobReceived(this, m_job, params);
+    return true;
+}
+
+
+const DaemonClient::JobContext *DaemonClient::findContext(const String &jobId) const
+{
+    for (const JobContext &context : m_contexts) {
+        if (context.jobId == jobId) {
+            return &context;
+        }
+    }
+
+    return nullptr;
+}
+
+
+void DaemonClient::trimContexts()
+{
+    const uint64_t now = Chrono::steadyMSecs();
+    while (m_contexts.size() > kJobHistorySize) {
+        m_contexts.pop_back();
+    }
+
+    while (m_contexts.size() > 1 && now >= m_contexts.back().createdSteadyMs + kJobHistoryMs) {
+        m_contexts.pop_back();
+    }
+}
+
+
+int64_t DaemonClient::submit(const JobResult &result)
+{
+    trimContexts();
+    const JobContext *context = findContext(result.jobId);
+    if (!context || !result.nonce || strlen(result.nonce) != 8) {
         return -1;
     }
 
-    char *data = m_blocktemplateStr.data();
+    String blocktemplate(context->blocktemplate);
+    char *data = blocktemplate.data();
+    memcpy(data + context->nonceOffset * 2, result.nonce, 8);
 
-    const size_t sig_offset = m_job.nonceOffset() + m_job.nonceSize();
+    if (context->hasMinerSignature) {
+        if (!result.sig || strlen(result.sig) != BlockTemplate::kSignatureSize * 2 ||
+            !result.sig_data || strlen(result.sig_data) < BlockTemplate::kKeySize * 4) {
+            return -1;
+        }
 
-#   ifdef XMRIG_PROXY_PROJECT
+        memcpy(data + context->signatureOffset * 2, result.sig, BlockTemplate::kSignatureSize * 2);
+        memcpy(data + context->txPublicKeyOffset * 2, result.sig_data, BlockTemplate::kKeySize * 2);
+        memcpy(data + context->ephPublicKeyOffset * 2,
+               result.sig_data + BlockTemplate::kKeySize * 2,
+               BlockTemplate::kKeySize * 2);
 
-    memcpy(data + m_job.nonceOffset() * 2, result.nonce, 8);
-
-    if (m_blocktemplate.hasMinerSignature() && result.sig) {
-        memcpy(data + sig_offset * 2, result.sig, 64 * 2);
-        memcpy(data + m_blocktemplate.offset(BlockTemplate::TX_PUBKEY_OFFSET) * 2, result.sig_data, 32 * 2);
-        memcpy(data + m_blocktemplate.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET) * 2, result.sig_data + 32 * 2, 32 * 2);
-
-        // Handle view tag for txout_to_tagged_key outputs
-        if (m_blocktemplate.outputType() == 3) {
-            Cvt::toHex(data + m_blocktemplate.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET) * 2 + 32 * 2, 2, &result.view_tag, 1);
+        if (context->hasViewTag) {
+            Cvt::toHex(data + context->ephPublicKeyOffset * 2 + BlockTemplate::kKeySize * 2,
+                       2, &result.view_tag, 1);
         }
     }
 
     if (result.extra_nonce >= 0) {
-        Cvt::toHex(data + m_blocktemplate.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) * 2, 8, reinterpret_cast<const uint8_t*>(&result.extra_nonce), 4);
+        Cvt::toHex(data + context->extraNonceOffset * 2, 8,
+                   reinterpret_cast<const uint8_t *>(&result.extra_nonce), 4);
     }
-
-#   else
-
-    Cvt::toHex(data + m_job.nonceOffset() * 2, 8, reinterpret_cast<const uint8_t*>(&result.nonce), 4);
-
-    if (m_blocktemplate.hasMinerSignature()) {
-        Cvt::toHex(data + sig_offset * 2, 128, result.minerSignature(), 64);
-    }
-
-#   endif
 
     using namespace rapidjson;
     Document doc(kObjectType);
-
     Value params(kArrayType);
-    params.PushBack(m_blocktemplateStr.toJSON(), doc.GetAllocator());
+    params.PushBack(blocktemplate.toJSON(), doc.GetAllocator());
 
-    JsonRequest::create(doc, m_sequence, "submitblock", params);
+    const int64_t requestId = m_sequence;
+    JsonRequest::create(doc, requestId, "submitblock", params);
 
-#   ifdef XMRIG_PROXY_PROJECT
-    m_results[m_sequence] = SubmitResult(m_sequence, result.diff, result.actualDiff(), result.id, 0);
-#   else
-    m_results[m_sequence] = SubmitResult(m_sequence, result.diff, result.actualDiff(), 0, result.backend);
-#   endif
+    m_results[requestId] = SubmitResult(
+        requestId,
+        context->difficulty,
+        result.actualDiff(),
+        result.id,
+        0,
+        result.shareId,
+        result.jobId,
+        context->generation,
+        context->height,
+        context->entropy
+    );
+
+    LiveEventStream::Row row("submit_block");
+    row.templateId       = std::to_string(context->generation);
+    row.height           = context->height;
+    row.jobId            = context->jobId.data() ? context->jobId.data() : "";
+    row.entropyHex       = context->entropy.data() ? context->entropy.data() : "";
+    row.networkTargetDiff = context->difficulty;
+    row.shareDiff        = result.actualDiff();
+    row.shareId          = result.shareId;
+    row.minerRequestId   = result.id;
+    row.daemonRequestId  = requestId;
+    row.nonce            = result.nonce;
+    row.resultHash       = result.result ? result.result : "";
+    row.status           = "requested";
+    LiveEventStream::publish(row);
 
     std::map<std::string, std::string> headers;
     headers.insert({"X-Hash-Difficulty", std::to_string(result.actualDiff())});
@@ -190,64 +447,27 @@ int64_t xmrig::DaemonClient::submit(const JobResult &result)
 }
 
 
-void xmrig::DaemonClient::connect()
+int64_t DaemonClient::rpcSend(const rapidjson::Document &doc, const std::map<std::string, std::string> &headers)
 {
-    auto connectError = [this](const char *message) {
-        if (!isQuiet()) {
-            LOG_ERR("%s " RED("connect error: ") RED_BOLD("\"%s\""), tag(), message);
-        }
-
-        retry();
-    };
-
-    setState(ConnectingState);
-
-    if (!m_coin.isValid() && !m_pool.algorithm().isValid()) {
-        return connectError("Invalid algorithm.");
+    const int64_t requestId = m_sequence++;
+    FetchRequest req(HTTP_POST, m_pool.host(), m_pool.port(), kJsonRpc, doc, m_pool.isTLS(), isQuiet());
+    req.fingerprint = m_pool.fingerprint();
+    req.timeout = std::max<uint64_t>(5000, std::min<uint64_t>(m_pool.jobTimeout(), 60000));
+    for (const auto &header : headers) {
+        req.headers.insert(header);
     }
 
-    if (!m_pool.algorithm().isValid()) {
-        m_pool.setAlgo(m_coin.algorithm());
-    }
-
-    if ((m_apiVersion == API_MONERO) && !m_walletAddress.isValid()) {
-        return connectError("Invalid wallet address.");
-    }
-
-    if (m_pool.zmq_port() >= 0) {
-        m_dns = Dns::resolve(m_pool.host(), this);
-    }
-    else {
-        getBlockTemplate();
-    }
+    // HttpClient stores the tag pointer for the life of the asynchronous
+    // request, so it must not point into this DaemonClient's mutable string.
+    fetch(kSubmitTag, std::move(req), m_httpListener, kHttpSubmit, static_cast<uint64_t>(requestId));
+    return requestId;
 }
 
 
-void xmrig::DaemonClient::connect(const Pool &pool)
+void DaemonClient::onHttpData(const HttpData &data)
 {
-    setPool(pool);
-    connect();
-}
-
-
-void xmrig::DaemonClient::setPool(const Pool &pool)
-{
-    BaseClient::setPool(pool);
-
-    m_walletAddress.decode(m_user);
-
-    m_coin = pool.coin().isValid() ?  pool.coin() : m_walletAddress.coin();
-
-    if (!m_coin.isValid() && pool.algorithm() == Algorithm::RX_WOW) {
-        m_coin = Coin::WOWNERO;
-    }
-}
-
-
-void xmrig::DaemonClient::onHttpData(const HttpData &data)
-{
-    if (data.status != 200) {
-        return retry();
+    if (data.userType != kHttpSubmit) {
+        return;
     }
 
     m_ip = data.ip().c_str();
@@ -257,678 +477,127 @@ void xmrig::DaemonClient::onHttpData(const HttpData &data)
     m_tlsFingerprint = data.tlsFingerprint();
 #   endif
 
+    if (data.status != 200) {
+        const std::string error = std::string("HTTP ") + std::to_string(data.status);
+        rapidjson::Value empty(rapidjson::kNullType);
+        rapidjson::Document doc(rapidjson::kObjectType);
+        auto &allocator = doc.GetAllocator();
+        rapidjson::Value rpcError(rapidjson::kObjectType);
+        rpcError.AddMember("message", rapidjson::Value(error.c_str(), allocator), allocator);
+        parseSubmitResponse(static_cast<int64_t>(data.rpcId), empty, rpcError);
+        return;
+    }
+
     rapidjson::Document doc;
     if (doc.Parse(data.body.c_str()).HasParseError()) {
-        if (!isQuiet()) {
-            LOG_ERR("%s " RED("JSON decode failed: ") RED_BOLD("\"%s\""), tag(), rapidjson::GetParseError_En(doc.GetParseError()));
-        }
-
-        return retry();
-    }
-
-    if (data.method == HTTP_GET) {
-        if (data.url == kGetHeight) {
-            if (!doc.HasMember(kHash)) {
-                m_apiVersion = API_CRYPTONOTE_DEFAULT;
-
-                return send(kGetInfo);
-            }
-
-            const uint64_t height = Json::getUint64(doc, kHeight);
-            const String hash = Json::getString(doc, kHash);
-
-            if (isOutdated(height, hash)) {
-                // Multiple /getheight responses can come at once resulting in multiple getBlockTemplate() calls
-                if ((height != m_blocktemplateRequestHeight) || (hash != m_blocktemplateRequestHash)) {
-                    m_blocktemplateRequestHeight = height;
-                    m_blocktemplateRequestHash = hash;
-                    getBlockTemplate();
-                }
-            }
-        }
-        else if (data.url == kGetInfo) {
-            const uint64_t height = Json::getUint64(doc, kHeight);
-            const String hash = Json::getString(doc, "top_block_hash");
-
-            if (isOutdated(height, hash)) {
-                // Multiple /getinfo responses can come at once resulting in multiple getBlockTemplate() calls
-                if ((height != m_blocktemplateRequestHeight) || (hash != m_blocktemplateRequestHash)) {
-                    m_blocktemplateRequestHeight = height;
-                    m_blocktemplateRequestHash = hash;
-                    getBlockTemplate();
-                }
-            }
-        }
-
+        const std::string error = std::string("JSON decode failed: ") + rapidjson::GetParseError_En(doc.GetParseError());
+        rapidjson::Document synthetic(rapidjson::kObjectType);
+        auto &allocator = synthetic.GetAllocator();
+        rapidjson::Value rpcError(rapidjson::kObjectType);
+        rpcError.AddMember("message", rapidjson::Value(error.c_str(), allocator), allocator);
+        rapidjson::Value empty(rapidjson::kNullType);
+        parseSubmitResponse(static_cast<int64_t>(data.rpcId), empty, rpcError);
         return;
     }
 
-    if (!parseResponse(Json::getInt64(doc, "id", -1), Json::getObject(doc, "result"), Json::getObject(doc, "error"))) {
-        retry();
-    }
-}
-
-
-void xmrig::DaemonClient::onTimer(const Timer *)
-{
-    if (m_pool.zmq_port() >= 0) {
-        m_prevHash = nullptr;
-        m_blocktemplateRequestHash = nullptr;
-        send(kGetHeight);
+    const int64_t responseId = Json::getInt64(doc, "id", -1);
+    if (responseId != static_cast<int64_t>(data.rpcId)) {
+        rapidjson::Document synthetic(rapidjson::kObjectType);
+        auto &allocator = synthetic.GetAllocator();
+        rapidjson::Value rpcError(rapidjson::kObjectType);
+        rpcError.AddMember("message", "Mismatched submitblock response id", allocator);
+        rapidjson::Value empty(rapidjson::kNullType);
+        parseSubmitResponse(static_cast<int64_t>(data.rpcId), empty, rpcError);
         return;
     }
 
-    if (Chrono::steadyMSecs() >= m_jobSteadyMs + m_pool.jobTimeout()) {
-        m_prevHash = nullptr;
-        m_blocktemplateRequestHash = nullptr;
-    }
-
-    if (m_state == ConnectingState) {
-        connect();
-    }
-    else if (m_state == ConnectedState) {
-        send((m_apiVersion == API_MONERO) ? kGetHeight : kGetInfo);
-    }
+    parseSubmitResponse(static_cast<int64_t>(data.rpcId),
+                        Json::getObject(doc, "result"), Json::getObject(doc, "error"));
 }
 
 
-void xmrig::DaemonClient::onResolved(const DnsRecords &records, int status, const char* error)
+bool DaemonClient::parseSubmitResponse(int64_t id, const rapidjson::Value &result, const rapidjson::Value &error)
 {
-    m_dns.reset();
-
-    if (status < 0 && records.isEmpty()) {
-        if (!isQuiet()) {
-            LOG_ERR("%s " RED("DNS error: ") RED_BOLD("\"%s\""), tag(), error);
-        }
-
-        retry();
-        return;
-    }
-
-
-    const auto &record = records.get();
-    m_ip = record.ip();
-
-    auto req = new uv_connect_t;
-    req->data = m_storage.ptr(m_key);
-
-    uv_tcp_t* s = new uv_tcp_t;
-    s->data = m_storage.ptr(m_key);
-
-    uv_tcp_init(uv_default_loop(), s);
-    uv_tcp_nodelay(s, 1);
-
-    if (Platform::hasKeepalive()) {
-        uv_tcp_keepalive(s, 1, 60);
-    }
-
-    if (m_pool.zmq_port() > 0) {
-        delete m_ZMQSocket;
-        m_ZMQSocket = s;
-        uv_tcp_connect(req, s, record.addr(m_pool.zmq_port()), onZMQConnect);
-    }
-}
-
-
-bool xmrig::DaemonClient::isOutdated(uint64_t height, const char *hash) const
-{
-    return m_job.height() != height || m_prevHash != hash || Chrono::steadyMSecs() >= m_jobSteadyMs + m_pool.jobTimeout();
-}
-
-
-bool xmrig::DaemonClient::parseJob(const rapidjson::Value &params, int *code)
-{
-    auto jobError = [this, code](const char *message) {
-        if (!isQuiet()) {
-            LOG_ERR("%s " RED("job error: ") RED_BOLD("\"%s\""), tag(), message);
-        }
-
-        *code = 1;
-
-        return false;
-    };
-
-    Job job(false, m_pool.algorithm(), String());
-
-    String blocktemplate = Json::getString(params, kBlocktemplateBlob);
-
-    if (blocktemplate.isNull()) {
-        return jobError("Empty block template received from daemon."); // FIXME
-    }
-
-    if (!m_blocktemplate.parse(blocktemplate, m_coin)) {
-        return jobError("Invalid block template received from daemon.");
-    }
-
-#   ifdef XMRIG_PROXY_PROJECT
-    const size_t k = m_blocktemplate.offset(BlockTemplate::MINER_TX_PREFIX_OFFSET);
-    job.setMinerTx(
-        m_blocktemplate.blob() + k,
-        m_blocktemplate.blob() + m_blocktemplate.offset(BlockTemplate::MINER_TX_PREFIX_END_OFFSET),
-        m_blocktemplate.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET) - k,
-        m_blocktemplate.offset(BlockTemplate::TX_PUBKEY_OFFSET) - k,
-        m_blocktemplate.offset(BlockTemplate::TX_EXTRA_NONCE_OFFSET) - k,
-        m_blocktemplate.txExtraNonce().size(),
-        m_blocktemplate.minerTxMerkleTreeBranch(),
-        m_blocktemplate.minerTxMerkleTreePath(),
-        m_blocktemplate.outputType() == 3
-    );
-#   endif
-
-    m_blockhashingblob = Json::getString(params, kBlockhashingBlob);
-
-    if (m_blocktemplate.hasMinerSignature()) {
-        if (m_pool.spendSecretKey().isEmpty()) {
-            return jobError("Secret spend key is not set.");
-        }
-
-        if (m_pool.spendSecretKey().size() != 64) {
-            return jobError("Secret spend key has invalid length. It must be 64 hex characters.");
-        }
-
-        uint8_t secret_spendkey[32];
-        if (!Cvt::fromHex(secret_spendkey, 32, m_pool.spendSecretKey(), 64)) {
-            return jobError("Secret spend key is not a valid hex data.");
-        }
-
-        uint8_t public_spendkey[32];
-        if (!secret_key_to_public_key(secret_spendkey, public_spendkey)) {
-            return jobError("Secret spend key is invalid.");
-        }
-
-#       ifdef XMRIG_PROXY_PROJECT
-        job.setSpendSecretKey(secret_spendkey);
-#       else
-        uint8_t secret_viewkey[32];
-        derive_view_secret_key(secret_spendkey, secret_viewkey);
-
-        uint8_t public_viewkey[32];
-        if (!secret_key_to_public_key(secret_viewkey, public_viewkey)) {
-            return jobError("Secret view key is invalid.");
-        }
-
-        uint8_t derivation[32];
-        if (!generate_key_derivation(m_blocktemplate.blob(BlockTemplate::TX_PUBKEY_OFFSET), secret_viewkey, derivation, nullptr)) {
-            return jobError("Failed to generate key derivation for miner signature.");
-        }
-
-        if (!m_walletAddress.decode(m_pool.user())) {
-            return jobError("Invalid wallet address.");
-        }
-
-        if (memcmp(m_walletAddress.spendKey(), public_spendkey, sizeof(public_spendkey)) != 0) {
-            return jobError("Wallet address and spend key don't match.");
-        }
-
-        if (memcmp(m_walletAddress.viewKey(), public_viewkey, sizeof(public_viewkey)) != 0) {
-            return jobError("Wallet address and view key don't match.");
-        }
-
-        uint8_t eph_secret_key[32];
-        derive_secret_key(derivation, 0, secret_spendkey, eph_secret_key);
-
-        job.setEphemeralKeys(m_blocktemplate.blob(BlockTemplate::EPH_PUBLIC_KEY_OFFSET), eph_secret_key);
-#       endif
-    }
-
-    if (m_coin.isValid()) {
-        job.setAlgorithm(m_coin.algorithm(m_blocktemplate.majorVersion()));
-    }
-
-    if (!job.setBlob(m_blockhashingblob)) {
-        *code = 3;
+    auto it = m_results.find(id);
+    if (it == m_results.end()) {
         return false;
     }
 
-    job.setSeedHash(Json::getString(params, "seed_hash"));
-    job.setHeight(Json::getUint64(params, kHeight));
-    job.setDiff(Json::getUint64(params, "difficulty"));
+    std::string errorMessage;
+    const char *message = nullptr;
+    int64_t errorCode = 0;
 
-    m_currentJobId = Cvt::toHex(Cvt::randomBytes(4));
-    job.setId(m_currentJobId);
-
-    m_job              = std::move(job);
-    m_blocktemplateStr = std::move(blocktemplate);
-    m_prevHash         = Json::getString(params, "prev_hash");
-    m_jobSteadyMs      = Chrono::steadyMSecs();
-
-    if (m_state == ConnectingState) {
-        setState(ConnectedState);
+    if (error.IsObject()) {
+        errorMessage = Json::getString(error, "message", "submitblock RPC error");
+        message = errorMessage.c_str();
+        errorCode = Json::getInt64(error, "code", 0);
+    }
+    else if (!result.IsObject()) {
+        message = "Invalid submitblock response";
+    }
+    else {
+        const char *status = Json::getString(result, "status");
+        if (!status || strcmp(status, "OK") != 0) {
+            errorMessage = "submitblock status: ";
+            errorMessage += status ? status : "missing";
+            message = errorMessage.c_str();
+        }
+        else {
+            const char *blockId = Json::getString(result, "block_id");
+            uint8_t blockHash[32];
+            if (!blockId || strlen(blockId) != sizeof(blockHash) * 2 ||
+                !Cvt::fromHex(blockHash, sizeof(blockHash), blockId, sizeof(blockHash) * 2)) {
+                message = "Invalid submitblock block_id";
+            }
+        }
     }
 
-    m_listener->onJobReceived(this, m_job, params);
+    const SubmitResult &submission = it->second;
+    LiveEventStream::Row row("submit_block_result");
+    if (submission.templateGeneration) {
+        row.templateId = std::to_string(submission.templateGeneration);
+    }
+    if (submission.height) {
+        row.height = submission.height;
+    }
+    row.jobId             = submission.jobId.data() ? submission.jobId.data() : "";
+    row.entropyHex        = submission.entropy.data() ? submission.entropy.data() : "";
+    row.networkTargetDiff = submission.diff;
+    row.shareDiff         = submission.actualDiff;
+    if (submission.shareId) {
+        row.shareId = submission.shareId;
+    }
+    row.minerRequestId  = submission.reqId;
+    row.daemonRequestId = submission.seq;
+    row.latencyMs       = Chrono::steadyMSecs() >= submission.startTime()
+        ? Chrono::steadyMSecs() - submission.startTime() : 0;
+    row.status          = message ? "rejected" : "accepted";
+    if (errorCode) {
+        row.errorCode = errorCode;
+    }
+    row.errorMessage = message ? message : "";
+    LiveEventStream::publish(row);
+
+    handleSubmitResponse(id, message);
     return true;
 }
 
 
-bool xmrig::DaemonClient::parseResponse(int64_t id, const rapidjson::Value &result, const rapidjson::Value &error)
-{
-    if (id == -1) {
-        return false;
-    }
-
-    if (error.IsObject()) {
-        const char *message = error["message"].GetString();
-
-        if (!handleSubmitResponse(id, message) && !isQuiet()) {
-            LOG_ERR("[%s:%d] error: " RED_BOLD("\"%s\"") RED_S ", code: %d", m_pool.host().data(), m_pool.port(), message, error["code"].GetInt());
-        }
-
-        return false;
-    }
-
-    if (!result.IsObject()) {
-        return false;
-    }
-
-    if (result.HasMember("top_block_hash")) {
-        if (m_prevHash != Json::getString(result, "top_block_hash")) {
-            getBlockTemplate();
-        }
-        return true;
-    }
-
-    int code = -1;
-    if (result.HasMember(kBlocktemplateBlob) && parseJob(result, &code)) {
-        return true;
-    }
-
-    const char* error_msg = nullptr;
-
-    if (handleSubmitResponse(id, error_msg)) {
-        if (error_msg || (m_pool.zmq_port() < 0)) {
-            getBlockTemplate();
-        }
-        return true;
-    }
-
-
-    return false;
-}
-
-
-int64_t xmrig::DaemonClient::getBlockTemplate()
-{
-    using namespace rapidjson;
-    Document doc(kObjectType);
-    auto &allocator = doc.GetAllocator();
-
-    Value params(kObjectType);
-    params.AddMember("wallet_address", m_user.toJSON(), allocator);
-    params.AddMember("extra_nonce", Cvt::toHex(Cvt::randomBytes(kBlobReserveSize)).toJSON(doc), allocator);
-
-    JsonRequest::create(doc, m_sequence, "getblocktemplate", params);
-
-    return rpcSend(doc);
-}
-
-
-int64_t xmrig::DaemonClient::rpcSend(const rapidjson::Document &doc, const std::map<std::string, std::string> &headers)
-{
-    FetchRequest req(HTTP_POST, m_pool.host(), m_pool.port(), kJsonRPC, doc, m_pool.isTLS(), isQuiet());
-    for (const auto &header : headers) {
-        req.headers.insert(header);
-    }
-
-    fetch(tag(), std::move(req), m_httpListener);
-
-    return m_sequence++;
-}
-
-
-void xmrig::DaemonClient::retry()
-{
-    m_failures++;
-    m_listener->onClose(this, static_cast<int>(m_failures));
-
-    if (m_failures == -1) {
-        return;
-    }
-
-    if (m_state == ConnectedState) {
-        setState(ConnectingState);
-    }
-
-    if ((m_ZMQConnectionState != ZMQ_NOT_CONNECTED) && (m_ZMQConnectionState != ZMQ_DISCONNECTING)) {
-        if (Platform::hasKeepalive()) {
-            uv_tcp_keepalive(m_ZMQSocket, 0, 60);
-        }
-        uv_close(reinterpret_cast<uv_handle_t*>(m_ZMQSocket), onZMQClose);
-    }
-
-    m_timer->stop();
-    m_timer->start(m_retryPause, 0);
-}
-
-
-void xmrig::DaemonClient::send(const char *path)
-{
-    FetchRequest req(HTTP_GET, m_pool.host(), m_pool.port(), path, m_pool.isTLS(), isQuiet());
-    fetch(tag(), std::move(req), m_httpListener);
-}
-
-
-void xmrig::DaemonClient::setState(SocketState state)
+void DaemonClient::setState(SocketState state)
 {
     if (m_state == state) {
         return;
     }
 
     m_state = state;
-
-    switch (state) {
-    case ConnectedState:
-        {
-            m_failures = 0;
-            m_listener->onLoginSuccess(this);
-
-            if (m_pool.zmq_port() < 0) {
-                const uint64_t interval = std::max<uint64_t>(20, m_pool.pollInterval());
-                m_timer->start(interval, interval);
-            }
-            else {
-                const uint64_t t = m_pool.jobTimeout();
-                m_timer->start(t, t);
-            }
-        }
-        break;
-
-    case UnconnectedState:
+    if (state == ConnectedState) {
+        m_failures = 0;
+        m_listener->onLoginSuccess(this);
+    }
+    else if (state == UnconnectedState) {
         m_failures = -1;
-        m_timer->stop();
-        break;
-
-    default:
-        break;
     }
 }
 
 
-void xmrig::DaemonClient::onZMQConnect(uv_connect_t* req, int status)
-{
-    DaemonClient* client = getClient(req->data);
-    delete req;
-
-    if (!client) {
-        return;
-    }
-
-    if (status < 0) {
-        LOG_ERR("%s " RED("ZMQ connect error: ") RED_BOLD("\"%s\""), client->tag(), uv_strerror(status));
-        client->retry();
-        return;
-    }
-
-    client->ZMQConnected();
-}
-
-
-void xmrig::DaemonClient::onZMQRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf)
-{
-    DaemonClient* client = getClient(stream->data);
-    if (client) {
-        client->ZMQRead(nread, buf);
-    }
-
-    NetBuffer::release(buf);
-}
-
-
-void xmrig::DaemonClient::onZMQClose(uv_handle_t* handle)
-{
-    DaemonClient* client = getClient(handle->data);
-    if (client) {
-#       ifdef APP_DEBUG
-        LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" disconnected"), client->m_pool.host().data(), client->m_pool.zmq_port());
-#       endif
-        client->m_ZMQConnectionState = ZMQ_NOT_CONNECTED;
-    }
-}
-
-
-void xmrig::DaemonClient::onZMQShutdown(uv_handle_t* handle)
-{
-    DaemonClient* client = getClient(handle->data);
-    if (client) {
-#       ifdef APP_DEBUG
-        LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" shutdown"), client->m_pool.host().data(), client->m_pool.zmq_port());
-#       endif
-        client->m_ZMQConnectionState = ZMQ_NOT_CONNECTED;
-        m_storage.remove(client->m_key);
-    }
-}
-
-
-void xmrig::DaemonClient::ZMQConnected()
-{
-#   ifdef APP_DEBUG
-    LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" connected"), m_pool.host().data(), m_pool.zmq_port());
-#   endif
-
-    m_ZMQConnectionState = ZMQ_GREETING_1;
-    m_ZMQSendBuf.reserve(256);
-    m_ZMQRecvBuf.reserve(256);
-
-    if (ZMQWrite(kZMQGreeting, kZMQGreetingSize1)) {
-        uv_read_start(reinterpret_cast<uv_stream_t*>(m_ZMQSocket), NetBuffer::onAlloc, onZMQRead);
-    }
-}
-
-
-bool xmrig::DaemonClient::ZMQWrite(const char* data, size_t size)
-{
-    m_ZMQSendBuf.assign(data, data + size);
-
-    uv_buf_t buf;
-    buf.base = m_ZMQSendBuf.data();
-    buf.len = static_cast<uint32_t>(m_ZMQSendBuf.size());
-
-    const int rc = uv_try_write(reinterpret_cast<uv_stream_t*>(m_ZMQSocket), &buf, 1);
-
-    if (static_cast<size_t>(rc) == buf.len) {
-        return true;
-    }
-
-    LOG_ERR("%s " RED("ZMQ write failed, rc = %d"), tag(), rc);
-    ZMQClose();
-    return false;
-}
-
-
-void xmrig::DaemonClient::ZMQRead(ssize_t nread, const uv_buf_t* buf)
-{
-    if (nread <= 0) {
-        LOG_ERR("%s " RED("ZMQ read failed, nread = %" PRId64), tag(), nread);
-        ZMQClose();
-        return;
-    }
-
-    m_ZMQRecvBuf.insert(m_ZMQRecvBuf.end(), buf->base, buf->base + nread);
-
-    do {
-        switch (m_ZMQConnectionState) {
-        case ZMQ_GREETING_1:
-            if (m_ZMQRecvBuf.size() >= kZMQGreetingSize1) {
-                if ((m_ZMQRecvBuf[0] == static_cast<char>(-1)) && (m_ZMQRecvBuf[9] == 127) && (m_ZMQRecvBuf[10] == 3)) {
-                    ZMQWrite(kZMQGreeting + kZMQGreetingSize1, sizeof(kZMQGreeting) - kZMQGreetingSize1);
-                    m_ZMQConnectionState = ZMQ_GREETING_2;
-                    break;
-                }
-
-                LOG_ERR("%s " RED("ZMQ handshake failed: invalid greeting format"), tag());
-                ZMQClose();
-            }
-            return;
-
-        case ZMQ_GREETING_2:
-            if (m_ZMQRecvBuf.size() >= sizeof(kZMQGreeting)) {
-                if (memcmp(m_ZMQRecvBuf.data() + 12, kZMQGreeting + 12, 20) == 0) {
-                    m_ZMQConnectionState = ZMQ_HANDSHAKE;
-                    m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + sizeof(kZMQGreeting));
-
-                    ZMQWrite(kZMQHandshake, sizeof(kZMQHandshake) - 1);
-                    break;
-                }
-
-                LOG_ERR("%s " RED("ZMQ handshake failed: invalid greeting format 2"), tag());
-                ZMQClose();
-
-            }
-            return;
-
-        case ZMQ_HANDSHAKE:
-            if (m_ZMQRecvBuf.size() >= 2) {
-                if (m_ZMQRecvBuf[0] != 4) {
-                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake format"), tag());
-                    ZMQClose();
-                    return;
-                }
-
-                const size_t size = static_cast<unsigned char>(m_ZMQRecvBuf[1]);
-                if (size < 18) {
-                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake size"), tag());
-                    ZMQClose();
-                    return;
-                }
-
-                if (m_ZMQRecvBuf.size() < size + 2) {
-                    return;
-                }
-
-                if (memcmp(m_ZMQRecvBuf.data() + 2, kZMQHandshake + 2, 18) != 0) {
-                    LOG_ERR("%s " RED("ZMQ handshake failed: invalid handshake data"), tag());
-                    ZMQClose();
-                    return;
-                }
-
-                ZMQWrite(kZMQSubscribe, sizeof(kZMQSubscribe) - 1);
-
-                m_ZMQConnectionState = ZMQ_CONNECTED;
-                m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + size + 2);
-
-                getBlockTemplate();
-                break;
-            }
-            return;
-
-        case ZMQ_CONNECTED:
-            ZMQParse();
-            return;
-
-        default:
-            return;
-        }
-    } while (true);
-}
-
-
-void xmrig::DaemonClient::ZMQParse()
-{
-#   ifdef APP_DEBUG
-    std::vector<char> msg;
-#   endif
-
-    size_t msg_size = 0;
-
-    char *data   = m_ZMQRecvBuf.data();
-    size_t avail = m_ZMQRecvBuf.size();
-    bool more    = false;
-
-    do {
-        if (avail < 1) {
-            return;
-        }
-
-        more                 = (data[0] & 1) != 0;
-        const bool long_size = (data[0] & 2) != 0;
-        const bool command   = (data[0] & 4) != 0;
-
-        ++data;
-        --avail;
-
-        uint64_t size = 0;
-        if (long_size)
-        {
-            if (avail < sizeof(uint64_t)) {
-                return;
-            }
-            size = bswap_64(*((uint64_t*)data));
-            data += sizeof(uint64_t);
-            avail -= sizeof(uint64_t);
-        }
-        else
-        {
-            if (avail < sizeof(uint8_t)) {
-                return;
-            }
-            size = static_cast<uint8_t>(*data);
-            ++data;
-            --avail;
-        }
-
-        if (size > 1024U - msg_size)
-        {
-            LOG_ERR("%s " RED("ZMQ message is too large, size = %" PRIu64 " bytes"), tag(), size);
-            ZMQClose();
-            return;
-        }
-
-        if (avail < size) {
-            return;
-        }
-
-        if (!command) {
-#           ifdef APP_DEBUG
-            msg.insert(msg.end(), data, data + size);
-#           endif
-
-            msg_size += size;
-        }
-
-        data += size;
-        avail -= size;
-    } while (more);
-
-    m_ZMQRecvBuf.erase(m_ZMQRecvBuf.begin(), m_ZMQRecvBuf.begin() + (data - m_ZMQRecvBuf.data()));
-
-#   ifdef APP_DEBUG
-    msg.push_back('\0');
-    LOG_DEBUG(CYAN("tcp-zmq://%s:%u") BLACK_BOLD(" read ") CYAN_BOLD("%zu") BLACK_BOLD(" bytes") " %s", m_pool.host().data(), m_pool.zmq_port(), msg.size() - 1, msg.data());
-#   endif
-
-    // Clear previous hash and check daemon height to guarantee that xmrig will call get_block_template RPC later
-    // We can't call get_block_template directly because daemon is not ready yet
-    m_prevHash = nullptr;
-    m_blocktemplateRequestHash = nullptr;
-    send(kGetHeight);
-
-    const uint64_t t = m_pool.jobTimeout();
-    m_timer->stop();
-    m_timer->start(t, t);
-}
-
-
-bool xmrig::DaemonClient::ZMQClose(bool shutdown)
-{
-    if ((m_ZMQConnectionState == ZMQ_NOT_CONNECTED) || (m_ZMQConnectionState == ZMQ_DISCONNECTING)) {
-        if (shutdown) {
-            m_storage.remove(m_key);
-        }
-        return false;
-    }
-
-    m_ZMQConnectionState = ZMQ_DISCONNECTING;
-
-    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(m_ZMQSocket)) == 0) {
-        if (Platform::hasKeepalive()) {
-            uv_tcp_keepalive(m_ZMQSocket, 0, 60);
-        }
-        uv_close(reinterpret_cast<uv_handle_t*>(m_ZMQSocket), shutdown ? onZMQShutdown : onZMQClose);
-        if (!shutdown) {
-            retry();
-        }
-        return true;
-    }
-
-    return false;
-}
+} /* namespace xmrig */

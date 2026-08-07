@@ -45,6 +45,7 @@ set(HEADERS
     src/proxy/log/AccessLog.h
     src/proxy/log/ShareLog.h
     src/proxy/Login.h
+    src/proxy/live/LiveEventStream.h
     src/proxy/Miner.h
     src/proxy/Miners.h
     src/proxy/Proxy.h
@@ -90,6 +91,7 @@ set(SOURCES
     src/proxy/log/AccessLog.cpp
     src/proxy/log/ShareLog.cpp
     src/proxy/Login.cpp
+    src/proxy/live/LiveEventStream.cpp
     src/proxy/Miner.cpp
     src/proxy/Miners.cpp
     src/proxy/Proxy.cpp

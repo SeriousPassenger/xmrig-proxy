@@ -27,6 +27,7 @@
 
 
 #include "base/tools/Chrono.h"
+#include "base/tools/String.h"
 
 
 namespace xmrig {
@@ -37,23 +38,37 @@ class SubmitResult
 public:
     SubmitResult() = default;
 
-    inline SubmitResult(int64_t seq, uint64_t diff, uint64_t actualDiff, int64_t reqId, uint32_t backend) :
+    inline SubmitResult(int64_t seq, uint64_t diff, uint64_t actualDiff, int64_t reqId, uint32_t backend,
+                        uint64_t shareId = 0, const String &jobId = String(),
+                        uint64_t templateGeneration = 0, uint64_t height = 0,
+                        const String &entropy = String()) :
         reqId(reqId),
         seq(seq),
         backend(backend),
+        shareId(shareId),
         actualDiff(actualDiff),
         diff(diff),
+        height(height),
+        entropy(entropy),
+        jobId(jobId),
+        templateGeneration(templateGeneration),
         m_start(Chrono::steadyMSecs())
     {}
 
     inline void done() { elapsed = Chrono::steadyMSecs() - m_start; }
+    inline uint64_t startTime() const { return m_start; }
 
     int64_t reqId           = 0;
     int64_t seq             = 0;
     uint32_t backend        = 0;
+    uint64_t shareId        = 0;
     uint64_t actualDiff     = 0;
     uint64_t diff           = 0;
     uint64_t elapsed        = 0;
+    uint64_t height         = 0;
+    String entropy;
+    String jobId;
+    uint64_t templateGeneration = 0;
 
 private:
     uint64_t m_start        = 0;

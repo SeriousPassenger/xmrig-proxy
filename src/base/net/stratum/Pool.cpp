@@ -217,6 +217,8 @@ bool xmrig::Pool::isEqual(const Pool &other) const
             && m_jobTimeout   == other.m_jobTimeout
             && m_daemon       == other.m_daemon
             && m_proxy        == other.m_proxy
+            && m_spendSecretKey == other.m_spendSecretKey
+            && m_zmqPort      == other.m_zmqPort
             );
 }
 

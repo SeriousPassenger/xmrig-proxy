@@ -36,6 +36,7 @@
 #include "proxy/events/AcceptEvent.h"
 #include "proxy/events/SubmitEvent.h"
 #include "proxy/Miner.h"
+#include "base/tools/Chrono.h"
 
 
 #include <cinttypes>
@@ -90,6 +91,10 @@ void xmrig::SimpleMapper::reuse(Miner *miner)
     m_idleTime = 0;
     m_miner    = miner;
     m_miner->setMapperId(static_cast<ssize_t>(m_id));
+
+    if (m_currentJob.job.isValid()) {
+        m_miner->setJob(m_currentJob.job);
+    }
 }
 
 
@@ -113,21 +118,22 @@ void xmrig::SimpleMapper::submit(SubmitEvent *event)
         return event->setError(Error::BadGateway);
     }
 
-    if (!isValidJobId(event->request.jobId)) {
+    const JobEntry *entry = findJob(event->request.jobId);
+    if (!entry || !entry->strategy) {
         return event->setError(Error::InvalidJobId);
     }
 
-    if (event->request.algorithm.isValid() && event->request.algorithm != m_job.algorithm()) {
+    const Job &job = entry->job;
+
+    if (event->request.algorithm.isValid() && event->request.algorithm != job.algorithm()) {
         return event->setError(Error::IncorrectAlgorithm);
     }
 
     JobResult req = event->request;
-    req.diff = m_job.diff();
+    req.diff = job.diff();
 
-    IStrategy *strategy = m_donate && m_donate->isActive() ? m_donate : m_strategy;
-
-    if (strategy) {
-        strategy->submit(req);
+    if (entry->strategy->submit(req) < 0) {
+        event->setError(Error::BadGateway);
     }
 }
 
@@ -155,6 +161,13 @@ void xmrig::SimpleMapper::onActive(IStrategy *strategy, IClient *client)
     }
 
     if (m_pending && strategy == m_pending) {
+        // Jobs from the previous strategy cannot be reconstructed by the new
+        // daemon client. Invalidate them before deleting their owner.
+        m_currentJob = {};
+        m_jobHistory.clear();
+        if (m_miner) {
+            m_miner->clearTelemetryJobs();
+        }
         delete m_strategy;
 
         m_strategy = strategy;
@@ -175,7 +188,7 @@ void xmrig::SimpleMapper::onActive(IStrategy *strategy, IClient *client)
 }
 
 
-void xmrig::SimpleMapper::onJob(IStrategy *, IClient *client, const Job &job, const rapidjson::Value &)
+void xmrig::SimpleMapper::onJob(IStrategy *strategy, IClient *client, const Job &job, const rapidjson::Value &)
 {
     if (m_controller->config()->isVerbose()) {
         LOG_INFO("%s " CYAN("%04u ") MAGENTA_BOLD("new job") " from " WHITE_BOLD("%s:%d") " diff " WHITE_BOLD("%" PRIu64) " algo " WHITE_BOLD("%s") " height " WHITE_BOLD("%" PRIu64),
@@ -186,7 +199,7 @@ void xmrig::SimpleMapper::onJob(IStrategy *, IClient *client, const Job &job, co
         return;
     }
 
-    setJob(job);
+    setJob(job, strategy);
 }
 
 
@@ -227,18 +240,24 @@ void xmrig::SimpleMapper::onVerifyAlgorithm(IStrategy *strategy, const IClient *
 }
 
 
-bool xmrig::SimpleMapper::isValidJobId(const String &id) const
+const xmrig::SimpleMapper::JobEntry *xmrig::SimpleMapper::findJob(const String &id) const
 {
-    if (m_job.id() == id) {
-        return true;
+    static constexpr uint64_t kJobHistoryMs = 120000;
+    const uint64_t now = Chrono::steadyMSecs();
+
+    if (m_currentJob.job.id() == id && m_currentJob.strategy) {
+        return &m_currentJob;
     }
 
-    if (m_prevJob.isValid() && m_prevJob.id() == id) {
-        Counters::expired++;
-        return true;
+    for (const JobEntry &entry : m_jobHistory) {
+        if (entry.job.isValid() && entry.job.id() == id && entry.strategy &&
+            now < entry.issuedAt + kJobHistoryMs) {
+            Counters::expired++;
+            return &entry;
+        }
     }
 
-    return false;
+    return nullptr;
 }
 
 
@@ -252,19 +271,31 @@ void xmrig::SimpleMapper::connect()
 }
 
 
-void xmrig::SimpleMapper::setJob(const Job &job)
+void xmrig::SimpleMapper::setJob(const Job &job, IStrategy *strategy)
 {
-    if (m_job.clientId() == job.clientId()) {
-        m_prevJob = m_job;
+    // DaemonClient retains six contexts total: current plus five previous.
+    static constexpr size_t kJobHistorySize = 5;
+
+    if (m_currentJob.job.isValid() && m_currentJob.strategy == strategy &&
+        m_currentJob.job.clientId() == job.clientId()) {
+        m_jobHistory.push_front(m_currentJob);
+        while (m_jobHistory.size() > kJobHistorySize) {
+            m_jobHistory.pop_back();
+        }
     }
     else {
-        m_prevJob.reset();
+        m_jobHistory.clear();
+        if (m_miner) {
+            m_miner->clearTelemetryJobs();
+        }
     }
 
-    m_job   = job;
+    m_currentJob.job      = job;
+    m_currentJob.strategy = strategy;
+    m_currentJob.issuedAt = Chrono::steadyMSecs();
     m_dirty = false;
 
     if (m_miner) {
-        m_miner->setJob(m_job);
+        m_miner->setJob(m_currentJob.job);
     }
 }

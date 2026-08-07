@@ -64,7 +64,9 @@ public:
     inline bool isShouldSave() const               { return m_upgrade && isAutoSave(); }
     inline const BindHosts &bind() const           { return m_bind; }
     inline const String &accessLog() const         { return m_accessLog; }
+    inline const String &eventStreamPath() const   { return m_eventStreamPath; }
     inline const String &password() const          { return m_password; }
+    inline bool isEventStreamEnabled() const       { return m_eventStreamEnabled; }
     inline int mode() const                        { return m_mode; }
     inline int reuseTimeout() const                { return m_reuseTimeout; }
     inline static IConfig *create()                { return new Config(); }
@@ -80,9 +82,11 @@ private:
     bool m_algoExt              = true;
     bool m_customDiffStats      = false;
     bool m_debug                = false;
+    bool m_eventStreamEnabled   = false;
     int m_mode                  = NICEHASH_MODE;
     int m_reuseTimeout          = 0;
     String m_accessLog;
+    String m_eventStreamPath    = "/run/xmrig-proxy/events.sock";
     String m_password;
     uint64_t m_diff             = 0;
     Workers::Mode m_workersMode = Workers::RigID;

@@ -27,9 +27,11 @@
 
 #include <algorithm>
 #include <bitset>
+#include <deque>
 #include <uv.h>
 
 #include "3rdparty/rapidjson/fwd.h"
+#include "base/crypto/Algorithm.h"
 #include "base/kernel/interfaces/ILineListener.h"
 #include "base/net/tools/LineReader.h"
 #include "base/net/tools/Storage.h"
@@ -70,6 +72,7 @@ public:
     ~Miner() override;
 
     bool accept(uv_stream_t *server);
+    inline void clearTelemetryJobs()                           { m_telemetryJobs.clear(); }
     void forwardJob(const Job &job, const char *algo);
     void replyWithError(int64_t id, const char *message);
     void setJob(Job &job, int64_t extra_nonce = -1);
@@ -79,6 +82,8 @@ public:
     inline const char *ip() const                                 { return m_ip; }
     inline const String &agent() const                            { return m_agent; }
     inline const String &password() const                         { return m_password; }
+    inline const String &currentJobId() const                     { return m_currentJobId; }
+    inline const String &currentJobEntropy() const                { return m_currentJobEntropy; }
     inline const String &rigId(bool safe = false) const           { return (safe ? (m_rigId.size() > 0 ? m_rigId : m_user) : m_rigId); }
     inline const String &user() const                             { return m_user; }
     inline int32_t routeId() const                                { return m_routeId; }
@@ -88,6 +93,9 @@ public:
     inline uint16_t localPort() const                             { return m_localPort; }
     inline uint64_t customDiff() const                            { return m_customDiff; }
     inline uint64_t diff() const                                  { return (m_customDiff ? std::min(m_customDiff, m_diff) : m_diff); }
+    inline uint64_t jobHeight() const                             { return m_jobHeight; }
+    inline uint64_t networkDiff() const                           { return m_diff; }
+    inline uint64_t templateGeneration() const                    { return m_templateGeneration; }
     inline uint64_t expire() const                                { return m_expire; }
     inline uint64_t rx() const                                    { return m_rx; }
     inline uint64_t timestamp() const                             { return m_timestamp; }
@@ -106,18 +114,33 @@ protected:
 private:
     class Tls;
 
+    struct TelemetryJob
+    {
+        Algorithm algorithm;
+        String entropy;
+        String id;
+        uint64_t height = 0;
+        uint64_t issuedAt = 0;
+        uint64_t minerDiff = 0;
+        uint64_t networkDiff = 0;
+        uint64_t templateGeneration = 0;
+    };
+
     constexpr static size_t kLoginTimeout  = 10 * 1000;
     constexpr static size_t kSocketTimeout = 60 * 10 * 1000;
 
     bool isWritable() const;
+    bool writeRaw(const char *data, size_t size);
+    const TelemetryJob *findTelemetryJob(const String &id) const;
     bool parseRequest(int64_t id, const char *method, const rapidjson::Value &params);
+    void rememberJob(const Job &job);
     bool send(BIO *bio);
     void heartbeat();
     void parse(char *line, size_t len);
     void read(ssize_t nread, const uv_buf_t *buf);
-    void send(const rapidjson::Document &doc);
-    void send(int size);
-    void sendJob(const char *blob, const char *jobId, const char *target, const char *algo, uint64_t height, const String &seedHash, const String &signatureKey);
+    bool send(const rapidjson::Document &doc);
+    bool send(int size);
+    bool sendJob(const char *blob, const char *jobId, const char *target, const char *algo, uint64_t height, const String &seedHash, const String &signatureKey);
     void setState(State state);
     void shutdown(bool had_error);
     void startTLS(const char *data);
@@ -141,18 +164,23 @@ private:
     State m_state           = WaitLoginState;
     std::bitset<EXT_MAX> m_extensions;
     String m_agent;
+    String m_currentJobEntropy;
+    String m_currentJobId;
     String m_password;
     String m_rigId;
     String m_user;
     String m_signatureData;
+    std::deque<TelemetryJob> m_telemetryJobs;
     uint8_t m_viewTag       = 0;
     Tls *m_tls              = nullptr;
     uint16_t m_localPort;
     uint64_t m_customDiff   = 0;
     uint64_t m_diff         = 0;
+    uint64_t m_jobHeight    = 0;
     uint64_t m_expire;
     uint64_t m_rx           = 0;
     uint64_t m_timestamp;
+    uint64_t m_templateGeneration = 0;
     uint64_t m_tx           = 0;
     uint8_t m_fixedByte     = 0;
     int64_t m_extraNonce    = -1;

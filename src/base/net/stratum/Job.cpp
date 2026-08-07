@@ -247,8 +247,11 @@ void xmrig::Job::copy(const Job &other)
     memcpy(m_blob, other.m_blob, sizeof(m_blob));
 
 #   ifdef XMRIG_PROXY_PROJECT
-    m_rawSeedHash = other.m_rawSeedHash;
-    m_rawSigKey   = other.m_rawSigKey;
+    m_rawSeedHash          = other.m_rawSeedHash;
+    m_rawSigKey            = other.m_rawSigKey;
+    m_templateEntropy      = other.m_templateEntropy;
+    m_templateFetchedMs    = other.m_templateFetchedMs;
+    m_templateGeneration   = other.m_templateGeneration;
 
     memcpy(m_rawBlob, other.m_rawBlob, sizeof(m_rawBlob));
     memcpy(m_rawTarget, other.m_rawTarget, sizeof(m_rawTarget));
@@ -303,8 +306,11 @@ void xmrig::Job::move(Job &&other)
     other.m_algorithm   = Algorithm::INVALID;
 
 #   ifdef XMRIG_PROXY_PROJECT
-    m_rawSeedHash = std::move(other.m_rawSeedHash);
-    m_rawSigKey   = std::move(other.m_rawSigKey);
+    m_rawSeedHash          = std::move(other.m_rawSeedHash);
+    m_rawSigKey            = std::move(other.m_rawSigKey);
+    m_templateEntropy      = std::move(other.m_templateEntropy);
+    m_templateFetchedMs    = other.m_templateFetchedMs;
+    m_templateGeneration   = other.m_templateGeneration;
 
     memcpy(m_rawBlob, other.m_rawBlob, sizeof(m_rawBlob));
     memcpy(m_rawTarget, other.m_rawTarget, sizeof(m_rawTarget));

@@ -18,6 +18,7 @@
 
 #include "core/config/Config.h"
 #include "3rdparty/rapidjson/document.h"
+#include "base/io/json/Json.h"
 #include "base/io/log/Log.h"
 #include "base/kernel/interfaces/IJsonReader.h"
 #include "base/net/dns/Dns.h"
@@ -70,6 +71,15 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
     m_accessLog    = reader.getString("access-log-file");
     m_password     = reader.getString("access-password");
 
+    const rapidjson::Value &eventStream = reader.getObject("event-stream");
+    if (eventStream.IsObject()) {
+        m_eventStreamEnabled = Json::getBool(eventStream, "enabled", m_eventStreamEnabled);
+        const char *path = Json::getString(eventStream, "path");
+        if (path && path[0] == '/') {
+            m_eventStreamPath = path;
+        }
+    }
+
     setCustomDiff(reader.getUint64("custom-diff", m_diff));
     setMode(reader.getString("mode"));
     setWorkersMode(reader.getValue("workers"));
@@ -120,6 +130,11 @@ void xmrig::Config::getJSON(rapidjson::Document &doc) const
     doc.AddMember(StringRef(kHttp),                 m_http.toJSON(doc), allocator);
 
     doc.AddMember(StringRef(kBackground),           isBackground(), allocator);
+
+    Value eventStream(kObjectType);
+    eventStream.AddMember("enabled",               m_eventStreamEnabled, allocator);
+    eventStream.AddMember("path",                  m_eventStreamPath.toJSON(doc), allocator);
+    doc.AddMember("event-stream",                  eventStream, allocator);
 
     Value bind(kArrayType);
     for (const auto &host : m_bind) {

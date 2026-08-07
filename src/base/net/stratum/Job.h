@@ -103,6 +103,15 @@ public:
     inline const char *rawTarget() const                { return m_rawTarget; }
     inline const String &rawSeedHash() const            { return m_rawSeedHash; }
     inline const String &rawSigKey() const              { return m_rawSigKey; }
+    inline const String &templateEntropy() const        { return m_templateEntropy; }
+    inline uint64_t templateFetchedMs() const           { return m_templateFetchedMs; }
+    inline uint64_t templateGeneration() const          { return m_templateGeneration; }
+    inline void setTemplateMetadata(uint64_t generation, uint64_t fetchedMs, const String &entropy)
+    {
+        m_templateGeneration = generation;
+        m_templateFetchedMs  = fetchedMs;
+        m_templateEntropy    = entropy;
+    }
 #   endif
 
     static inline uint64_t toDiff(uint64_t target)      { return target ? (0xFFFFFFFFFFFFFFFFULL / target) : 0; }
@@ -167,6 +176,9 @@ private:
     char m_rawTarget[24]{};
     String m_rawSeedHash;
     String m_rawSigKey;
+    String m_templateEntropy;
+    uint64_t m_templateFetchedMs  = 0;
+    uint64_t m_templateGeneration = 0;
 
     // Miner signatures
     uint8_t m_spendSecretKey[32]{};

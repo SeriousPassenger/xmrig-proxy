@@ -40,6 +40,7 @@
 #include "proxy/events/CloseEvent.h"
 #include "proxy/events/LoginEvent.h"
 #include "proxy/events/SubmitEvent.h"
+#include "proxy/live/LiveEventStream.h"
 
 
 #ifdef XMRIG_FEATURE_TLS
@@ -52,12 +53,17 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <utility>
 
 
 namespace xmrig {
-    static int64_t nextId = 0;
-    char Miner::m_sendBuf[16384] = { 0 };
-    Storage<Miner> Miner::m_storage;
+
+
+static uint64_t s_shareSequence = 0;
+static int64_t nextId = 0;
+char Miner::m_sendBuf[16384] = { 0 };
+Storage<Miner> Miner::m_storage;
 } // namespace xmrig
 
 
@@ -126,9 +132,40 @@ bool xmrig::Miner::accept(uv_stream_t *server)
 void xmrig::Miner::forwardJob(const Job &job, const char *algo)
 {
     m_diff = job.diff();
+    m_currentJobId       = job.id();
+    m_currentJobEntropy  = job.templateEntropy();
+    m_jobHeight          = job.height();
+    m_templateGeneration = job.templateGeneration();
     setFixedByte(job.fixedByte());
 
-    sendJob(job.rawBlob(), job.id().data(), job.rawTarget(), algo ? algo : job.algorithm().name(), job.height(), job.rawSeedHash(), job.rawSigKey());
+    if (!sendJob(job.rawBlob(), job.id().data(), job.rawTarget(), algo ? algo : job.algorithm().name(), job.height(), job.rawSeedHash(), job.rawSigKey())) {
+        return;
+    }
+
+    rememberJob(job);
+
+    LiveEventStream::Row row("job_sent");
+    row.minerId            = m_id;
+    row.mapperId           = m_mapperId;
+    row.minerIp            = m_ip;
+    row.listenPort         = m_localPort;
+    row.worker             = m_rigId.size() ? m_rigId.data() : (m_user.data() ? m_user.data() : "");
+    row.agent              = m_agent.data() ? m_agent.data() : "";
+    if (job.templateGeneration()) {
+        row.templateId = std::to_string(job.templateGeneration());
+    }
+    if (job.templateFetchedMs() && Chrono::steadyMSecs() >= job.templateFetchedMs()) {
+        row.templateAgeMs = Chrono::steadyMSecs() - job.templateFetchedMs();
+    }
+    row.height             = job.height();
+    row.seedHash           = job.rawSeedHash().data() ? job.rawSeedHash().data() : "";
+    row.algorithm          = algo ? algo : job.algorithm().name();
+    row.jobId              = job.id().data() ? job.id().data() : "";
+    row.entropyHex         = job.templateEntropy().data() ? job.templateEntropy().data() : "";
+    row.minerTargetDiff    = diff();
+    row.networkTargetDiff  = job.diff();
+    row.status             = "sent";
+    LiveEventStream::publish(row);
 }
 
 
@@ -148,6 +185,10 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     }
 
     m_diff = job.diff();
+    m_currentJobId       = job.id();
+    m_currentJobEntropy  = job.templateEntropy();
+    m_jobHeight          = job.height();
+    m_templateGeneration = job.templateGeneration();
     bool customDiff = false;
 
     if (m_customDiff && m_customDiff < m_diff) {
@@ -180,7 +221,34 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
         blob = tmp_blob;
     }
 
-    sendJob(blob, job.id().data(), customDiff ? m_sendBuf : job.rawTarget(), job.algorithm().name(), job.height(), job.rawSeedHash(), m_signatureData);
+    if (!sendJob(blob, job.id().data(), customDiff ? m_sendBuf : job.rawTarget(), job.algorithm().name(), job.height(), job.rawSeedHash(), m_signatureData)) {
+        return;
+    }
+
+    rememberJob(job);
+
+    LiveEventStream::Row row("job_sent");
+    row.minerId            = m_id;
+    row.mapperId           = m_mapperId;
+    row.minerIp            = m_ip;
+    row.listenPort         = m_localPort;
+    row.worker             = m_rigId.size() ? m_rigId.data() : (m_user.data() ? m_user.data() : "");
+    row.agent              = m_agent.data() ? m_agent.data() : "";
+    if (job.templateGeneration()) {
+        row.templateId = std::to_string(job.templateGeneration());
+    }
+    if (job.templateFetchedMs() && Chrono::steadyMSecs() >= job.templateFetchedMs()) {
+        row.templateAgeMs = Chrono::steadyMSecs() - job.templateFetchedMs();
+    }
+    row.height             = job.height();
+    row.seedHash           = job.rawSeedHash().data() ? job.rawSeedHash().data() : "";
+    row.algorithm          = job.algorithm().name();
+    row.jobId              = job.id().data() ? job.id().data() : "";
+    row.entropyHex         = job.templateEntropy().data() ? job.templateEntropy().data() : "";
+    row.minerTargetDiff    = diff();
+    row.networkTargetDiff  = job.diff();
+    row.status             = "sent";
+    LiveEventStream::publish(row);
 }
 
 
@@ -193,6 +261,52 @@ void xmrig::Miner::success(int64_t id, const char *status)
 bool xmrig::Miner::isWritable() const
 {
     return m_state != ClosingState && uv_is_writable(reinterpret_cast<const uv_stream_t*>(m_socket)) == 1;
+}
+
+
+const xmrig::Miner::TelemetryJob *xmrig::Miner::findTelemetryJob(const String &id) const
+{
+    static constexpr uint64_t kTelemetryJobTtl = 120000;
+    const uint64_t now = Chrono::steadyMSecs();
+
+    if (!m_telemetryJobs.empty() && m_telemetryJobs.front().id == id) {
+        return &m_telemetryJobs.front();
+    }
+
+    auto it = m_telemetryJobs.begin();
+    if (it != m_telemetryJobs.end()) {
+        ++it;
+    }
+
+    for (; it != m_telemetryJobs.end(); ++it) {
+        const TelemetryJob &job = *it;
+        if (job.id == id && now < job.issuedAt + kTelemetryJobTtl) {
+            return &job;
+        }
+    }
+
+    return nullptr;
+}
+
+
+void xmrig::Miner::rememberJob(const Job &job)
+{
+    static constexpr size_t kTelemetryJobCount = 6;
+
+    TelemetryJob telemetry;
+    telemetry.algorithm          = job.algorithm();
+    telemetry.entropy            = job.templateEntropy();
+    telemetry.id                 = job.id();
+    telemetry.height             = job.height();
+    telemetry.issuedAt           = Chrono::steadyMSecs();
+    telemetry.minerDiff          = diff();
+    telemetry.networkDiff        = job.diff();
+    telemetry.templateGeneration = job.templateGeneration();
+
+    m_telemetryJobs.push_front(std::move(telemetry));
+    while (m_telemetryJobs.size() > kTelemetryJobCount) {
+        m_telemetryJobs.pop_back();
+    }
 }
 
 
@@ -253,28 +367,89 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         Algorithm algorithm(Json::getString(params, "algo"));
 
         SubmitEvent *event = SubmitEvent::create(this, id, Json::getString(params, "job_id"), Json::getString(params, "nonce"), Json::getString(params, "result"), algorithm, Json::getString(params, "sig"), m_signatureData, Json::getString(params, "commitment"), m_viewTag, m_extraNonce);
+        Error::Code finalError = event->error();
+        event->setErrorSink(&finalError);
+        event->request.shareId = ++s_shareSequence;
 
-        if (!event->request.isValid() || event->request.actualDiff() < diff()) {
+        const TelemetryJob *telemetryJob = findTelemetryJob(event->request.jobId);
+        if (telemetryJob) {
+            event->request.templateEntropy    = telemetryJob->entropy;
+            event->request.height             = telemetryJob->height;
+            event->request.minerDiff          = telemetryJob->minerDiff;
+            event->request.networkDiff        = telemetryJob->networkDiff;
+            event->request.templateGeneration = telemetryJob->templateGeneration;
+        }
+
+        LiveEventStream::Row row("share_received");
+        row.minerId            = m_id;
+        row.mapperId           = m_mapperId;
+        row.minerIp            = m_ip;
+        row.listenPort         = m_localPort;
+        row.worker             = m_rigId.size() ? m_rigId.data() : (m_user.data() ? m_user.data() : "");
+        row.agent              = m_agent.data() ? m_agent.data() : "";
+        row.jobId              = event->request.jobId.data() ? event->request.jobId.data() : "";
+        row.shareId            = event->request.shareId;
+        row.minerRequestId     = event->request.id;
+        row.nonce              = event->request.nonce ? event->request.nonce : "";
+        row.resultHash         = event->request.result ? event->request.result : "";
+        if (event->request.minerDiff) {
+            row.minerTargetDiff = event->request.minerDiff;
+        }
+        row.shareDiff          = event->request.actualDiff();
+        row.status             = "received";
+        if (event->request.networkDiff) {
+            row.networkTargetDiff = event->request.networkDiff;
+            if (event->request.templateGeneration) {
+                row.templateId = std::to_string(event->request.templateGeneration);
+            }
+            if (event->request.height) {
+                row.height = event->request.height;
+            }
+            row.entropyHex = event->request.templateEntropy.data()
+                ? event->request.templateEntropy.data() : "";
+        }
+        LiveEventStream::publish(row);
+
+        if (!event->request.isValid()) {
+            event->setError(Error::LowDifficulty);
+        }
+        else if (!telemetryJob) {
+            event->setError(Error::InvalidJobId);
+        }
+        else if (event->request.algorithm.isValid() && event->request.algorithm != telemetryJob->algorithm) {
+            event->setError(Error::IncorrectAlgorithm);
+        }
+        else if (event->request.actualDiff() < telemetryJob->minerDiff) {
             event->setError(Error::LowDifficulty);
         }
         else if (hasExtension(EXT_NICEHASH) && !event->request.isCompatible(m_fixedByte)) {
             event->setError(Error::InvalidNonce);
         }
 
-        if (event->error() == Error::NoError && m_customDiff && event->request.actualDiff() < m_diff) {
+        if (event->error() == Error::NoError &&
+            event->request.minerDiff < event->request.networkDiff &&
+            event->request.actualDiff() < event->request.networkDiff) {
             success(id, "OK");
 
-            SubmitResult result = SubmitResult(1, m_customDiff, event->request.actualDiff(), event->request.id, 0);
+            SubmitResult result = SubmitResult(0, event->request.networkDiff, event->request.actualDiff(), event->request.id, 0,
+                                               event->request.shareId, event->request.jobId,
+                                               event->request.templateGeneration, event->request.height,
+                                               event->request.templateEntropy);
+
+            // SubmitEvent lives in the global placement buffer. It is not
+            // dispatched on this local custom-difficulty path, so destroy it
+            // before AcceptEvent reuses the same storage.
+            event->~SubmitEvent();
             AcceptEvent::start(m_mapperId, this, result, false, true);
 
             return true;
         }
 
         if (!event->start()) {
-            replyWithError(id, event->message());
+            replyWithError(id, Error::toString(finalError));
         }
 
-        return event->error() != Error::InvalidNonce;
+        return finalError != Error::InvalidNonce;
     }
 
     if (strcmp(method, "keepalived") == 0) {
@@ -300,22 +475,14 @@ bool xmrig::Miner::send(BIO *bio)
 
     LOG_DEBUG("[%s] TLS send     (%d bytes)", m_ip, static_cast<int>(buf.len));
 
-    if (!isWritable()) {
-        return false;
-    }
-
-    const int rc = uv_try_write(reinterpret_cast<uv_stream_t*>(m_socket), &buf, 1);
+    const bool written = writeRaw(buf.base, buf.len);
     (void) BIO_reset(bio);
 
-    if (rc < 0) {
-        shutdown(true);
-
-        return false;
+    if (written) {
+        m_tx += buf.len;
     }
 
-    m_tx += buf.len;
-
-    return true;
+    return written;
 #   else
     return false;
 #   endif
@@ -390,7 +557,7 @@ void xmrig::Miner::read(ssize_t nread, const uv_buf_t *buf)
 }
 
 
-void xmrig::Miner::send(const rapidjson::Document &doc)
+bool xmrig::Miner::send(const rapidjson::Document &doc)
 {
     using namespace rapidjson;
 
@@ -403,7 +570,7 @@ void xmrig::Miner::send(const rapidjson::Document &doc)
         LOG_ERR("[%s] send failed: \"send buffer overflow: %zu > %zu\"", m_ip, size, (sizeof(m_sendBuf) - 2));
         shutdown(true);
 
-        return;
+        return false;
     }
 
     memcpy(m_sendBuf, buffer.GetString(), size);
@@ -414,35 +581,91 @@ void xmrig::Miner::send(const rapidjson::Document &doc)
 }
 
 
-void xmrig::Miner::send(int size)
+bool xmrig::Miner::send(int size)
 {
     LOG_DEBUG("[%s] send (%d bytes): \"%s\"", m_ip, size, m_sendBuf);
 
     if (size <= 0 || !isWritable()) {
-        return;
+        return false;
     }
 
     int rc = -1;
 #   ifdef XMRIG_FEATURE_TLS
     if (isTLS()) {
-        rc = m_tls->send(m_sendBuf, size) ? 0 : -1;
+        return m_tls->send(m_sendBuf, size);
     }
     else
 #   endif
     {
-        uv_buf_t buf = uv_buf_init(m_sendBuf, (unsigned int) size);
-        rc = uv_try_write(reinterpret_cast<uv_stream_t*>(m_socket), &buf, 1);
+        rc = writeRaw(m_sendBuf, static_cast<size_t>(size)) ? size : -1;
     }
 
     if (rc < 0) {
-        return shutdown(true);
+        shutdown(true);
+        return false;
     }
 
     m_tx += size;
+    return true;
 }
 
 
-void xmrig::Miner::sendJob(const char *blob, const char *jobId, const char *target, const char *algo, uint64_t height, const String &seedHash, const String &signatureKey)
+bool xmrig::Miner::writeRaw(const char *data, size_t size)
+{
+    if (!data || size == 0 || !isWritable()) {
+        return false;
+    }
+
+    uv_buf_t immediate = uv_buf_init(const_cast<char *>(data), static_cast<unsigned int>(size));
+    const int attempted = uv_try_write(reinterpret_cast<uv_stream_t *>(m_socket), &immediate, 1);
+    if (attempted == static_cast<int>(size)) {
+        return true;
+    }
+
+    size_t offset = 0;
+    if (attempted > 0) {
+        offset = static_cast<size_t>(attempted);
+    }
+    else if (attempted != UV_EAGAIN && attempted != UV_ENOSYS) {
+        shutdown(true);
+        return false;
+    }
+
+    struct PendingWrite
+    {
+        uv_write_t request{};
+        std::string data;
+    };
+
+    auto *pending = new PendingWrite;
+    pending->data.assign(data + offset, size - offset);
+    pending->request.data = pending;
+
+    uv_buf_t queued = uv_buf_init(&pending->data[0], static_cast<unsigned int>(pending->data.size()));
+    const int rc = uv_write(&pending->request, reinterpret_cast<uv_stream_t *>(m_socket), &queued, 1,
+        [](uv_write_t *request, int status) {
+            auto *write = static_cast<PendingWrite *>(request->data);
+            if (status < 0 && request->handle) {
+                Miner *miner = getMiner(request->handle->data);
+                if (miner) {
+                    miner->shutdown(true);
+                }
+            }
+
+            delete write;
+        });
+
+    if (rc < 0) {
+        delete pending;
+        shutdown(true);
+        return false;
+    }
+
+    return true;
+}
+
+
+bool xmrig::Miner::sendJob(const char *blob, const char *jobId, const char *target, const char *algo, uint64_t height, const String &seedHash, const String &signatureKey)
 {
     using namespace rapidjson;
 
@@ -511,7 +734,7 @@ void xmrig::Miner::sendJob(const char *blob, const char *jobId, const char *targ
         doc.AddMember("params", params, allocator);
     }
 
-    send(doc);
+    return send(doc);
 }
 
 

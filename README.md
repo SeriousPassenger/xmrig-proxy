@@ -14,6 +14,11 @@ The codebase is shared with the [XMRig](https://github.com/xmrig/xmrig) miner.
 ## Compatibility
 Compatible with any pool and any miner that supports NiceHash.
 
+This fork also provides a shared cached `getblocktemplate` source for Monero
+daemon mining in `simple` mode, independent 16-byte OS-CSPRNG entropy per
+downstream job, exact historical-template submission, and an optional local
+Unix CSV event stream. See [Cached daemon mining in simple mode](doc/DAEMON_MINING.md).
+
 ## Why?
 This proxy is designed to handle donation traffic from XMRig. No other solution works well with high connection and disconnection rates.
 

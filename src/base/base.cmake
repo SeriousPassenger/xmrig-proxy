@@ -82,6 +82,7 @@ set(HEADERS_BASE
     src/base/tools/cryptonote/WalletAddress.h
     src/base/tools/Cvt.h
     src/base/tools/Handle.h
+    src/base/tools/SecureRandom.h
     src/base/tools/Span.h
     src/base/tools/String.h
     src/base/tools/Timer.h
@@ -140,6 +141,7 @@ set(SOURCES_BASE
     src/base/tools/cryptonote/Signatures.cpp
     src/base/tools/cryptonote/WalletAddress.cpp
     src/base/tools/Cvt.cpp
+    src/base/tools/SecureRandom.cpp
     src/base/tools/String.cpp
     src/base/tools/Timer.cpp
    )
@@ -200,6 +202,7 @@ if (WITH_HTTP)
         src/base/net/http/HttpData.h
         src/base/net/http/HttpResponse.h
         src/base/net/stratum/DaemonClient.h
+        src/base/net/stratum/DaemonTemplateSource.h
         src/base/net/stratum/SelfSelectClient.h
         src/base/net/tools/TcpServer.h
         )
@@ -220,6 +223,7 @@ if (WITH_HTTP)
         src/base/net/http/HttpListener.cpp
         src/base/net/http/HttpResponse.cpp
         src/base/net/stratum/DaemonClient.cpp
+        src/base/net/stratum/DaemonTemplateSource.cpp
         src/base/net/stratum/SelfSelectClient.cpp
         src/base/net/tools/TcpServer.cpp
         )

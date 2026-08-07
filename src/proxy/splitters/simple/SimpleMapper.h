@@ -26,6 +26,7 @@
 #define XMRIG_SIMPLEMAPPER_H
 
 
+#include <deque>
 #include <map>
 #include <uv.h>
 #include <vector>
@@ -66,7 +67,10 @@ public:
     void tick(uint64_t ticks, uint64_t now);
 
     inline bool isActive() const     { return m_active && m_miner; }
-    inline bool isReusable() const   { return m_active && !m_miner && !m_dirty; }
+    // A cached-daemon job embeds connection-private 16-byte entropy. Reusing
+    // that mapper for a different miner would reuse the same mining domain,
+    // so daemon-backed mappers are deliberately never recycled.
+    inline bool isReusable() const   { return m_active && !m_miner && !m_dirty && m_currentJob.job.templateEntropy().isEmpty(); }
     inline uint64_t id() const       { return m_id; }
     inline uint64_t idleTime() const { return m_idleTime; }
 
@@ -79,9 +83,16 @@ protected:
     void onVerifyAlgorithm(IStrategy *strategy, const IClient *client, const Algorithm &algorithm, bool *ok) override;
 
 private:
-    bool isValidJobId(const String &id) const;
+    struct JobEntry
+    {
+        Job job;
+        IStrategy *strategy = nullptr;
+        uint64_t issuedAt = 0;
+    };
+
+    const JobEntry *findJob(const String &id) const;
     void connect();
-    void setJob(const Job &job);
+    void setJob(const Job &job, IStrategy *strategy);
 
     bool m_active               = false;
     bool m_dirty                = false;
@@ -89,8 +100,8 @@ private:
     DonateStrategy *m_donate    = nullptr;
     IStrategy *m_pending        = nullptr;
     IStrategy *m_strategy;
-    Job m_job;
-    Job m_prevJob;
+    JobEntry m_currentJob;
+    std::deque<JobEntry> m_jobHistory;
     Miner *m_miner              = nullptr;
     uint64_t m_id;
     uint64_t m_idleTime         = 0;

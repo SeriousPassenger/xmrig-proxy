@@ -47,6 +47,7 @@ class Controller;
 class DonateSplitter;
 class ISplitter;
 class Login;
+class LiveEventStream;
 class Miner;
 class Miners;
 class ProxyDebug;
@@ -98,6 +99,7 @@ private:
     DonateSplitter *m_donate;
     ISplitter *m_splitter;
     Login *m_login;
+    LiveEventStream *m_eventStream = nullptr;
     Miners *m_miners;
     ProxyDebug *m_debug;
     ShareLog *m_shareLog;

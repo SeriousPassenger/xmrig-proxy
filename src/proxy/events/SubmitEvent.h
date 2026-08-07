@@ -46,11 +46,19 @@ public:
     bool expired = false;
     JobResult request;
 
+    inline ~SubmitEvent() override
+    {
+        if (m_errorSink) {
+            *m_errorSink = m_error;
+        }
+    }
+
 
     inline bool isRejected() const override { return m_error != Error::NoError; }
     inline const char *message() const      { return Error::toString(m_error); }
     inline Error::Code error() const        { return m_error; }
     inline void setError(Error::Code error) { m_error  = error; }
+    inline void setErrorSink(Error::Code *sink) { m_errorSink = sink; }
 
 
 protected:
@@ -62,6 +70,7 @@ protected:
 
 private:
     Error::Code m_error;
+    Error::Code *m_errorSink = nullptr;
 };
 
 

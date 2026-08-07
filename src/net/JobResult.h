@@ -54,7 +54,13 @@ public:
     const int64_t id          = 0;
     const int64_t extra_nonce = -1;
     String jobId;
+    String templateEntropy;
+    uint64_t shareId          = 0;
     uint64_t diff             = 0;
+    uint64_t height           = 0;
+    uint64_t minerDiff        = 0;
+    uint64_t networkDiff      = 0;
+    uint64_t templateGeneration = 0;
 
 private:
     uint64_t m_actualDiff     = 0;
