@@ -140,6 +140,31 @@ To save it explicitly, redirect the reader yourself:
 socat - UNIX-CONNECT:/run/xmrig-proxy/events.sock >shares.csv
 ```
 
+### Local web dashboard
+
+The separate dependency-free tool in `extras/event-dashboard/` consumes one
+schema-v2 socket connection and serves a read-only, scrollable dashboard on
+`127.0.0.1`. It includes event filtering and details, daemon-template health,
+and the top five observed accepted shares with their exact times and reported
+difficulties:
+
+```bash
+python3 extras/event-dashboard/xmrig_events_web.py \
+  /run/xmrig-proxy/events.sock \
+  --port 8787
+```
+
+It can also poll the loopback XMRig Proxy API for hashrate, results, resources,
+upstreams, and worker statistics. The bearer token is read from an environment
+variable or a protected file, stays in the Python backend, and is never sent
+to the browser. The dashboard deliberately never calls `/1/miners`, because
+that endpoint includes downstream passwords.
+
+See `extras/event-dashboard/README.md` for API setup, SSH local forwarding,
+coverage semantics, and tests. The dashboard is an observer, not an archival
+collector: reconnects have no replay. Use a separate socket subscriber such as
+the `socat` command above when a raw capture is required.
+
 The proxy serializes each row once and queues direct asynchronous libuv writes
 to connected readers. There is intentionally no application-level queue limit
 or drop policy. Therefore, do not leave a reader connected if it permanently
