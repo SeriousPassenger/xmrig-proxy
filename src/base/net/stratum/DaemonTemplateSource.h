@@ -58,6 +58,7 @@ public:
     {
         RequestKind kind       = RequestKind::BlockTemplate;
         RefreshReason reason   = RefreshReason::Initial;
+        uint64_t sourceId      = 0;
         uint64_t requestId     = 0;
         uint64_t generation    = 0;
         uint64_t startedUnixMs = 0;
@@ -71,6 +72,7 @@ public:
 
     struct NotificationMetadata
     {
+        uint64_t sourceId = 0;
         uint64_t sequence = 0;
         uint64_t unixMs   = 0;
     };
@@ -87,6 +89,7 @@ public:
         uint64_t height       = 0;
         uint64_t reservedOffset = 0;
         uint64_t reserveSize  = 0;
+        uint64_t sourceId     = 0;
         uint64_t generation   = 0;
         uint64_t fetchedSteadyMs = 0;
         String tlsFingerprint;
@@ -127,6 +130,7 @@ public:
     inline const Pool &pool() const                             { return m_pool; }
     inline const String &wallet() const                         { return m_wallet; }
     inline uint64_t interval() const                            { return m_interval; }
+    inline uint64_t sourceId() const                            { return m_sourceId; }
     inline std::shared_ptr<const Snapshot> latest() const       { return m_latest; }
 
     static const char *kindName(RequestKind kind);
@@ -195,6 +199,7 @@ private:
     uint64_t m_lastSuccessSteadyMs = 0;
     uint64_t m_notificationSequence = 0;
     uint64_t m_requestSequence  = 0;
+    uint64_t m_sourceId         = 0;
     uint32_t m_zmqHeightRetries = 0;
     ZmqSocketContext *m_zmqSocket = nullptr;
     std::vector<char> m_zmqRecvBuf;

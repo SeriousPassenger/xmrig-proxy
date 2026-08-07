@@ -61,6 +61,7 @@ public:
     uint64_t minerDiff        = 0;
     uint64_t networkDiff      = 0;
     uint64_t templateGeneration = 0;
+    uint64_t templateSourceId = 0;
 
 private:
     uint64_t m_actualDiff     = 0;

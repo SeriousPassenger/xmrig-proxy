@@ -106,8 +106,10 @@ public:
     inline const String &templateEntropy() const        { return m_templateEntropy; }
     inline uint64_t templateFetchedMs() const           { return m_templateFetchedMs; }
     inline uint64_t templateGeneration() const          { return m_templateGeneration; }
-    inline void setTemplateMetadata(uint64_t generation, uint64_t fetchedMs, const String &entropy)
+    inline uint64_t templateSourceId() const             { return m_templateSourceId; }
+    inline void setTemplateMetadata(uint64_t sourceId, uint64_t generation, uint64_t fetchedMs, const String &entropy)
     {
+        m_templateSourceId   = sourceId;
         m_templateGeneration = generation;
         m_templateFetchedMs  = fetchedMs;
         m_templateEntropy    = entropy;
@@ -179,6 +181,7 @@ private:
     String m_templateEntropy;
     uint64_t m_templateFetchedMs  = 0;
     uint64_t m_templateGeneration = 0;
+    uint64_t m_templateSourceId   = 0;
 
     // Miner signatures
     uint8_t m_spendSecretKey[32]{};

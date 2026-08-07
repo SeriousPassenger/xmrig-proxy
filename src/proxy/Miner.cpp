@@ -145,6 +145,9 @@ void xmrig::Miner::forwardJob(const Job &job, const char *algo)
     rememberJob(job);
 
     LiveEventStream::Row row("job_sent");
+    if (job.templateSourceId()) {
+        row.sourceId = job.templateSourceId();
+    }
     row.minerId            = m_id;
     row.mapperId           = m_mapperId;
     row.minerIp            = m_ip;
@@ -228,6 +231,9 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     rememberJob(job);
 
     LiveEventStream::Row row("job_sent");
+    if (job.templateSourceId()) {
+        row.sourceId = job.templateSourceId();
+    }
     row.minerId            = m_id;
     row.mapperId           = m_mapperId;
     row.minerIp            = m_ip;
@@ -302,6 +308,7 @@ void xmrig::Miner::rememberJob(const Job &job)
     telemetry.minerDiff          = diff();
     telemetry.networkDiff        = job.diff();
     telemetry.templateGeneration = job.templateGeneration();
+    telemetry.templateSourceId   = job.templateSourceId();
 
     m_telemetryJobs.push_front(std::move(telemetry));
     while (m_telemetryJobs.size() > kTelemetryJobCount) {
@@ -378,9 +385,13 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
             event->request.minerDiff          = telemetryJob->minerDiff;
             event->request.networkDiff        = telemetryJob->networkDiff;
             event->request.templateGeneration = telemetryJob->templateGeneration;
+            event->request.templateSourceId   = telemetryJob->templateSourceId;
         }
 
         LiveEventStream::Row row("share_received");
+        if (event->request.templateSourceId) {
+            row.sourceId = event->request.templateSourceId;
+        }
         row.minerId            = m_id;
         row.mapperId           = m_mapperId;
         row.minerIp            = m_ip;
@@ -434,7 +445,7 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
             SubmitResult result = SubmitResult(0, event->request.networkDiff, event->request.actualDiff(), event->request.id, 0,
                                                event->request.shareId, event->request.jobId,
                                                event->request.templateGeneration, event->request.height,
-                                               event->request.templateEntropy);
+                                               event->request.templateEntropy, event->request.templateSourceId);
 
             // SubmitEvent lives in the global placement buffer. It is not
             // dispatched on this local custom-difficulty path, so destroy it

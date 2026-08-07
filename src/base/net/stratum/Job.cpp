@@ -252,6 +252,7 @@ void xmrig::Job::copy(const Job &other)
     m_templateEntropy      = other.m_templateEntropy;
     m_templateFetchedMs    = other.m_templateFetchedMs;
     m_templateGeneration   = other.m_templateGeneration;
+    m_templateSourceId     = other.m_templateSourceId;
 
     memcpy(m_rawBlob, other.m_rawBlob, sizeof(m_rawBlob));
     memcpy(m_rawTarget, other.m_rawTarget, sizeof(m_rawTarget));
@@ -311,6 +312,7 @@ void xmrig::Job::move(Job &&other)
     m_templateEntropy      = std::move(other.m_templateEntropy);
     m_templateFetchedMs    = other.m_templateFetchedMs;
     m_templateGeneration   = other.m_templateGeneration;
+    m_templateSourceId     = other.m_templateSourceId;
 
     memcpy(m_rawBlob, other.m_rawBlob, sizeof(m_rawBlob));
     memcpy(m_rawTarget, other.m_rawTarget, sizeof(m_rawTarget));

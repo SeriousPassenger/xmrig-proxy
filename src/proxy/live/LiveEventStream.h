@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -82,6 +83,7 @@ public:
         OptionalNumber<uint64_t> listenPort;
         std::string worker;
         std::string agent;
+        OptionalNumber<uint64_t> sourceId;
         std::string templateId;
         OptionalNumber<uint64_t> templateAgeMs;
         std::string refreshReason;
@@ -122,7 +124,8 @@ public:
     inline const std::string &path() const noexcept { return m_path; }
     inline size_t clientCount() const noexcept      { return m_clients.size(); }
 
-    // This is intentionally a no-op when no running singleton or no subscriber exists.
+    // Socket output is a no-op without a running subscriber. The live
+    // instance may still retain pre-login ordering state until login/close.
     static bool publish(const Row &row);
     static LiveEventStream *instance() noexcept;
 
@@ -146,6 +149,7 @@ private:
     };
 
     bool broadcast(const Row &row);
+    bool publishOrdered(const Row &row);
     bool prepareSocketPath();
     bool rememberOwnedSocket();
     void accept(int status);
@@ -166,6 +170,7 @@ private:
     bool m_running          = false;
     std::string m_path;
     std::vector<Client *> m_clients;
+    std::map<int64_t, std::vector<Row> > m_preLoginJobs;
     uint64_t m_eventSequence = 0;
     uint64_t m_socketDevice  = 0;
     uint64_t m_socketInode   = 0;

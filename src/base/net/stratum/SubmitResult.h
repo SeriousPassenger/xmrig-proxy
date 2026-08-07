@@ -41,7 +41,7 @@ public:
     inline SubmitResult(int64_t seq, uint64_t diff, uint64_t actualDiff, int64_t reqId, uint32_t backend,
                         uint64_t shareId = 0, const String &jobId = String(),
                         uint64_t templateGeneration = 0, uint64_t height = 0,
-                        const String &entropy = String()) :
+                        const String &entropy = String(), uint64_t templateSourceId = 0) :
         reqId(reqId),
         seq(seq),
         backend(backend),
@@ -52,6 +52,7 @@ public:
         entropy(entropy),
         jobId(jobId),
         templateGeneration(templateGeneration),
+        templateSourceId(templateSourceId),
         m_start(Chrono::steadyMSecs())
     {}
 
@@ -69,6 +70,7 @@ public:
     String entropy;
     String jobId;
     uint64_t templateGeneration = 0;
+    uint64_t templateSourceId   = 0;
 
 private:
     uint64_t m_start        = 0;

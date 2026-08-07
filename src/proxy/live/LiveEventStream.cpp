@@ -247,6 +247,7 @@ void xmrig::LiveEventStream::stop()
     }
 
     m_running = false;
+    m_preLoginJobs.clear();
 
     while (!m_clients.empty()) {
         closeClient(m_clients.back());
@@ -269,7 +270,7 @@ void xmrig::LiveEventStream::stop()
 bool xmrig::LiveEventStream::publish(const Row &row)
 {
     LiveEventStream *stream = m_instance;
-    return stream && stream->m_running && stream->broadcast(row);
+    return stream && stream->m_running && stream->publishOrdered(row);
 }
 
 
@@ -284,6 +285,7 @@ void xmrig::LiveEventStream::onDaemonTemplateRequest(const DaemonTemplateSource:
 {
     Row row(request.kind == DaemonTemplateSource::RequestKind::BlockTemplate
         ? "template_refresh" : "daemon_height_check");
+    row.sourceId        = request.sourceId;
     row.refreshReason   = DaemonTemplateSource::reasonName(request.reason);
     row.daemonRequestId = static_cast<int64_t>(request.requestId);
     if (request.generation) {
@@ -302,6 +304,7 @@ void xmrig::LiveEventStream::onDaemonTemplate(const std::shared_ptr<const Daemon
     }
 
     Row row("template_cached");
+    row.sourceId         = snapshot->sourceId;
     row.templateId       = std::to_string(snapshot->generation);
     row.refreshReason    = DaemonTemplateSource::reasonName(snapshot->request.reason);
     row.height           = snapshot->height;
@@ -321,6 +324,7 @@ void xmrig::LiveEventStream::onDaemonTemplateError(const DaemonTemplateSource::R
 {
     Row row(request.kind == DaemonTemplateSource::RequestKind::BlockTemplate
         ? "template_error" : "daemon_height_error");
+    row.sourceId        = request.sourceId;
     row.refreshReason   = DaemonTemplateSource::reasonName(request.reason);
     row.daemonRequestId = static_cast<int64_t>(request.requestId);
     if (request.generation) {
@@ -336,8 +340,8 @@ void xmrig::LiveEventStream::onDaemonTemplateError(const DaemonTemplateSource::R
 
 void xmrig::LiveEventStream::onDaemonZmqNotification(const DaemonTemplateSource::NotificationMetadata &notification)
 {
-    (void) notification;
     Row row("zmq_new_block");
+    row.sourceId        = notification.sourceId;
     row.refreshReason   = "zmq";
     row.status          = "notified";
 
@@ -397,6 +401,9 @@ void xmrig::LiveEventStream::onEvent(IEvent *event)
         }
         row.jobId      = e->result.jobId.data() ? e->result.jobId.data() : "";
         row.entropyHex = e->result.entropy.data() ? e->result.entropy.data() : "";
+        if (e->result.templateSourceId) {
+            row.sourceId = e->result.templateSourceId;
+        }
         if (e->result.templateGeneration) {
             row.templateId = std::to_string(e->result.templateGeneration);
         }
@@ -472,6 +479,9 @@ void xmrig::LiveEventStream::onRejectedEvent(IEvent *event)
         }
         row.entropyHex = e->request.templateEntropy.data()
             ? e->request.templateEntropy.data() : "";
+        if (e->request.templateSourceId) {
+            row.sourceId = e->request.templateSourceId;
+        }
         row.shareDiff       = e->request.actualDiff();
         row.status          = "rejected_local";
         row.errorCode       = static_cast<int64_t>(e->error());
@@ -493,6 +503,9 @@ void xmrig::LiveEventStream::onRejectedEvent(IEvent *event)
         }
         row.jobId      = e->result.jobId.data() ? e->result.jobId.data() : "";
         row.entropyHex = e->result.entropy.data() ? e->result.entropy.data() : "";
+        if (e->result.templateSourceId) {
+            row.sourceId = e->result.templateSourceId;
+        }
         if (e->result.templateGeneration) {
             row.templateId = std::to_string(e->result.templateGeneration);
         }
@@ -541,6 +554,48 @@ bool xmrig::LiveEventStream::broadcast(const Row &row)
     }
 
     return true;
+}
+
+
+bool xmrig::LiveEventStream::publishOrdered(const Row &row)
+{
+    if (!row.minerId.set) {
+        return broadcast(row);
+    }
+
+    const int64_t minerId = row.minerId.value;
+    if (row.event == "worker_connected") {
+        m_preLoginJobs[minerId].clear();
+        return broadcast(row);
+    }
+
+    auto pending = m_preLoginJobs.find(minerId);
+    if (row.event == "job_sent" && pending != m_preLoginJobs.end()) {
+        pending->second.push_back(row);
+        return !m_clients.empty();
+    }
+
+    if (row.event == "worker_login") {
+        bool emitted = broadcast(row);
+        if (pending != m_preLoginJobs.end()) {
+            std::vector<Row> jobs = std::move(pending->second);
+            m_preLoginJobs.erase(pending);
+
+            if (row.status == "accepted") {
+                for (const Row &job : jobs) {
+                    emitted = broadcast(job) || emitted;
+                }
+            }
+        }
+
+        return emitted;
+    }
+
+    if (row.event == "worker_disconnected") {
+        m_preLoginJobs.erase(minerId);
+    }
+
+    return broadcast(row);
 }
 
 
@@ -711,7 +766,7 @@ std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence)
     std::string output;
     output.reserve(1024);
 
-    appendCsvField(output, "1");
+    appendCsvField(output, "2");
     appendCsvField(output, std::to_string(sequence));
     appendCsvField(output, utcNow());
     appendCsvField(output, row.event);
@@ -721,6 +776,7 @@ std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence)
     appendCsvField(output, number(row.listenPort));
     appendCsvField(output, row.worker);
     appendCsvField(output, row.agent);
+    appendCsvField(output, number(row.sourceId));
     appendCsvField(output, row.templateId);
     appendCsvField(output, number(row.templateAgeMs));
     appendCsvField(output, row.refreshReason);
@@ -755,7 +811,7 @@ const std::string &xmrig::LiveEventStream::csvHeader()
 {
     static const std::string header =
         "schema_version,event_seq,time_utc,event,miner_id,mapper_id,miner_ip,listen_port,worker,agent,"
-        "template_id,template_age_ms,refresh_reason,height,prev_hash,seed_hash,algo,job_id,entropy_hex,"
+        "source_id,template_id,template_age_ms,refresh_reason,height,prev_hash,seed_hash,algo,job_id,entropy_hex,"
         "miner_target_diff,network_target_diff,share_id,miner_request_id,daemon_request_id,nonce,result_hash,"
         "share_diff,status,error_code,error_message,latency_ms,connection_ms,rx_bytes,tx_bytes\n";
 

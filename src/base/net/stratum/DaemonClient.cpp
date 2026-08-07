@@ -305,7 +305,7 @@ bool DaemonClient::installTemplate(const std::shared_ptr<const DaemonTemplateSou
         return fail("Unable to allocate a collision-free private job id.");
     }
 
-    job.setTemplateMetadata(snapshot->generation, snapshot->fetchedSteadyMs, entropyHex);
+    job.setTemplateMetadata(snapshot->sourceId, snapshot->generation, snapshot->fetchedSteadyMs, entropyHex);
 
     JobContext context;
     context.blocktemplate      = blocktemplate;
@@ -323,6 +323,7 @@ bool DaemonClient::installTemplate(const std::shared_ptr<const DaemonTemplateSou
     context.difficulty         = snapshot->difficulty;
     context.generation         = snapshot->generation;
     context.height             = snapshot->height;
+    context.sourceId           = snapshot->sourceId;
 
     m_contexts.push_front(std::move(context));
     trimContexts();
@@ -422,10 +423,12 @@ int64_t DaemonClient::submit(const JobResult &result)
         result.jobId,
         context->generation,
         context->height,
-        context->entropy
+        context->entropy,
+        context->sourceId
     );
 
     LiveEventStream::Row row("submit_block");
+    row.sourceId         = context->sourceId;
     row.templateId       = std::to_string(context->generation);
     row.height           = context->height;
     row.jobId            = context->jobId.data() ? context->jobId.data() : "";
@@ -554,6 +557,9 @@ bool DaemonClient::parseSubmitResponse(int64_t id, const rapidjson::Value &resul
 
     const SubmitResult &submission = it->second;
     LiveEventStream::Row row("submit_block_result");
+    if (submission.templateSourceId) {
+        row.sourceId = submission.templateSourceId;
+    }
     if (submission.templateGeneration) {
         row.templateId = std::to_string(submission.templateGeneration);
     }

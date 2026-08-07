@@ -97,7 +97,7 @@ is disconnected.
 The fixed schema is:
 
 ```csv
-schema_version,event_seq,time_utc,event,miner_id,mapper_id,miner_ip,listen_port,worker,agent,template_id,template_age_ms,refresh_reason,height,prev_hash,seed_hash,algo,job_id,entropy_hex,miner_target_diff,network_target_diff,share_id,miner_request_id,daemon_request_id,nonce,result_hash,share_diff,status,error_code,error_message,latency_ms,connection_ms,rx_bytes,tx_bytes
+schema_version,event_seq,time_utc,event,miner_id,mapper_id,miner_ip,listen_port,worker,agent,source_id,template_id,template_age_ms,refresh_reason,height,prev_hash,seed_hash,algo,job_id,entropy_hex,miner_target_diff,network_target_diff,share_id,miner_request_id,daemon_request_id,nonce,result_hash,share_diff,status,error_code,error_message,latency_ms,connection_ms,rx_bytes,tx_bytes
 ```
 
 Events include:
@@ -114,6 +114,18 @@ bodies. The `worker` column uses the downstream rig ID or falls back to that
 downstream connection's login. `share_diff` is derived from the result hash
 supplied by the miner; it is telemetry, not an independent RandomX
 revalidation.
+
+Schema version 2 adds `source_id`. It is a nonzero, process-unique identifier
+for one shared daemon-template-source lifetime. Every miner using the same
+live cache has the same `source_id`; if its last client disconnects and a new
+source is later created, the new source receives a new ID. `template_id` and
+`daemon_request_id` are counters local to a source and can restart at 1, so
+use them together with `source_id`. Worker-only and ordinary pool rows leave
+`source_id` empty.
+
+`worker_login` is emitted before any warm-cache `job_sent` row for that miner.
+Only the telemetry row is held until login dispatch completes; the actual
+Stratum job is sent immediately.
 
 Read the stream with either command:
 
@@ -161,6 +173,11 @@ should occur for the shared source. A new Monero block should produce
 `zmq_new_block`, an immediate height check (with bounded 100 ms retries while
 RPC catches up), and then a template refresh.
 
-Correlate a candidate through `share_id`, `job_id`, `template_id`, and
-`daemon_request_id`: `share_received` -> `submit_block` ->
-`submit_block_result` -> `share_result`.
+Correlate a candidate through `share_id`, `job_id`, (`source_id`,
+`template_id`), and (`source_id`, `daemon_request_id`): `share_received` ->
+`submit_block` -> `submit_block_result` -> `share_result`.
+
+Downstream usernames and rig IDs are labels, not routing keys. Multiple
+connections may use the same values without sharing private jobs or entropy;
+reports that group by `worker` will intentionally aggregate them. Use
+different rig IDs only when you want separate worker rows in those reports.

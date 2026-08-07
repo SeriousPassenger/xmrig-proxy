@@ -31,6 +31,7 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -77,6 +78,7 @@ enum ZmqState {
 
 static std::map<std::string, std::weak_ptr<DaemonTemplateSource> > registry;
 static DaemonTemplateSource::Listener *observer = nullptr;
+static std::atomic<uint64_t> sourceSequence{0};
 
 
 static uint64_t requestTimeout(uint64_t interval)
@@ -122,7 +124,8 @@ DaemonTemplateSource::DaemonTemplateSource(const Pool &pool, const String &expan
     m_wallet(expandedWallet),
     m_timer(new Timer(this)),
     m_zmqTimer(new Timer(this)),
-    m_interval(std::max<uint64_t>(1000, pool.pollInterval()))
+    m_interval(std::max<uint64_t>(1000, pool.pollInterval())),
+    m_sourceId(sourceSequence.fetch_add(1, std::memory_order_relaxed) + 1)
 {
 }
 
@@ -366,6 +369,7 @@ void DaemonTemplateSource::requestTemplate(RefreshReason reason)
     m_templateRequest = {};
     m_templateRequest.kind = RequestKind::BlockTemplate;
     m_templateRequest.reason = reason;
+    m_templateRequest.sourceId = m_sourceId;
     m_templateRequest.requestId = ++m_requestSequence;
     m_templateRequest.generation = m_generation + 1;
     m_templateRequest.startedSteadyMs = Chrono::steadyMSecs();
@@ -415,6 +419,7 @@ void DaemonTemplateSource::requestHeight(bool followup)
     m_heightRequest = {};
     m_heightRequest.kind = RequestKind::Height;
     m_heightRequest.reason = RefreshReason::Zmq;
+    m_heightRequest.sourceId = m_sourceId;
     m_heightRequest.requestId = ++m_requestSequence;
     m_heightRequest.generation = m_generation;
     m_heightRequest.startedSteadyMs = Chrono::steadyMSecs();
@@ -493,6 +498,7 @@ void DaemonTemplateSource::onHttpData(const HttpData &data)
         snapshot->height            = Json::getUint64(result, kHeight);
         snapshot->reservedOffset    = Json::getUint64(result, "reserved_offset");
         snapshot->reserveSize       = kReserveSize;
+        snapshot->sourceId          = m_sourceId;
 
 #       ifdef XMRIG_FEATURE_TLS
         snapshot->tlsFingerprint    = data.tlsFingerprint();
@@ -734,6 +740,7 @@ void DaemonTemplateSource::notifyZmq()
 {
     auto keepAlive = shared_from_this();
     NotificationMetadata notification;
+    notification.sourceId = m_sourceId;
     notification.sequence = ++m_notificationSequence;
     notification.unixMs = Chrono::currentMSecsSinceEpoch();
 

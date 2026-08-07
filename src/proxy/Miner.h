@@ -124,6 +124,7 @@ private:
         uint64_t minerDiff = 0;
         uint64_t networkDiff = 0;
         uint64_t templateGeneration = 0;
+        uint64_t templateSourceId = 0;
     };
 
     constexpr static size_t kLoginTimeout  = 10 * 1000;

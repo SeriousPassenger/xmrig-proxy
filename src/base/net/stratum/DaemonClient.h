@@ -76,6 +76,7 @@ private:
         uint64_t difficulty       = 0;
         uint64_t generation       = 0;
         uint64_t height           = 0;
+        uint64_t sourceId         = 0;
     };
 
     const JobContext *findContext(const String &jobId) const;
