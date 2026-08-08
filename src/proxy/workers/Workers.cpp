@@ -304,6 +304,10 @@ void xmrig::Workers::accept(const AcceptEvent *event)
     }
 
     Worker &worker = m_workers[index];
+    if (event->result.isAmbiguous()) {
+        return;
+    }
+
     if (!event->isRejected()) {
         worker.add(m_controller->config()->isCustomDiffStats() ? event->statsDiff() : event->result.diff);
     }

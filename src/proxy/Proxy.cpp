@@ -74,6 +74,27 @@
 #endif
 
 
+namespace {
+
+
+xmrig::RandomXVerifier *createRandomXVerifier(const xmrig::Config *config)
+{
+    return new xmrig::RandomXVerifier(
+        config->randomXVerifierPath().data(),
+        config->randomXVerifierTimeout(),
+        config->randomXVerifierMaxQueue(),
+        config->randomXVerifierMaxPendingPerMiner(),
+        config->randomXVerifierCandidateLimit(),
+        config->randomXVerifierGlobalCandidateLimit(),
+        config->randomXVerifierEmergencyCandidateLimit(),
+        config->randomXVerifierMaxConsecutiveRejections()
+    );
+}
+
+
+} // namespace
+
+
 xmrig::Proxy::Proxy(Controller *controller) :
     m_controller(controller),
     m_customDiff(controller)
@@ -112,14 +133,7 @@ xmrig::Proxy::Proxy(Controller *controller) :
     }
 
     if (controller->config()->isRandomXVerifierEnabled()) {
-        m_randomXVerifier = new RandomXVerifier(
-            controller->config()->randomXVerifierPath().data(),
-            controller->config()->randomXVerifierTimeout(),
-            controller->config()->randomXVerifierMaxQueue(),
-            controller->config()->randomXVerifierMaxPendingPerMiner(),
-            controller->config()->randomXVerifierCandidateLimit(),
-            controller->config()->randomXVerifierMaxConsecutiveRejections()
-        );
+        m_randomXVerifier = createRandomXVerifier(controller->config());
     }
 
     m_timer = new Timer(this);
@@ -294,20 +308,12 @@ void xmrig::Proxy::printState()
 #endif
 
 
-void xmrig::Proxy::onConfigChanged(xmrig::Config *config, xmrig::Config *previous)
+void xmrig::Proxy::onConfigChanged(xmrig::Config *config, xmrig::Config *)
 {
+    // Runtime configuration reload is disabled for this proxy build. Keep the
+    // listener method for interface compatibility and defensive in-process
+    // callers only.
     m_debug->setEnabled(config->isDebug());
-
-    if (previous &&
-        (config->isRandomXVerifierEnabled() != previous->isRandomXVerifierEnabled() ||
-         config->randomXVerifierPath() != previous->randomXVerifierPath() ||
-         config->randomXVerifierTimeout() != previous->randomXVerifierTimeout() ||
-         config->randomXVerifierMaxQueue() != previous->randomXVerifierMaxQueue() ||
-         config->randomXVerifierMaxPendingPerMiner() != previous->randomXVerifierMaxPendingPerMiner() ||
-         config->randomXVerifierMaxConsecutiveRejections() != previous->randomXVerifierMaxConsecutiveRejections() ||
-         config->randomXVerifierCandidateLimit() != previous->randomXVerifierCandidateLimit())) {
-        LOG_WARN("randomx-verifier configuration changed; restart xmrig-proxy to apply it safely");
-    }
 }
 
 

@@ -82,6 +82,7 @@ public:
         String blocktemplateBlob;
         String blockhashingBlob;
         String seedHash;
+        String previousSeedHash;
         String nextSeedHash;
         String ip;
         String prevHash;
@@ -109,6 +110,7 @@ public:
         virtual void onDaemonTemplateRequest(const RequestMetadata &) {}
         virtual void onDaemonTemplateError(const RequestMetadata &, const char *) {}
         virtual void onDaemonZmqNotification(const NotificationMetadata &) {}
+        virtual void onDaemonTipChanged(uint64_t, uint64_t, const String &) {}
     };
 
     using Ptr = std::shared_ptr<DaemonTemplateSource>;
@@ -120,6 +122,7 @@ public:
      * not Pool::user(), so environment-expanded identities cannot collide.
      */
     static Ptr acquire(const Pool &pool, const String &expandedWallet);
+    static bool isCurrentTip(uint64_t sourceId, const String &prevHash);
     static void setObserver(Listener *observer);
     static void shutdownAll();
 
@@ -192,6 +195,8 @@ private:
     std::shared_ptr<DnsRequest> m_dns;
     std::shared_ptr<const Snapshot> m_latest;
     String m_wallet;
+    String m_previousSeedHash;
+    String m_observedTipHash;
     Timer *m_timer              = nullptr;
     Timer *m_zmqTimer           = nullptr;
     uint64_t m_generation       = 0;

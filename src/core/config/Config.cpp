@@ -19,12 +19,14 @@
 #include "core/config/Config.h"
 #include "3rdparty/rapidjson/document.h"
 #include "base/io/json/Json.h"
+#include "base/io/Env.h"
 #include "base/io/log/Log.h"
 #include "base/kernel/interfaces/IJsonReader.h"
 #include "base/net/dns/Dns.h"
 #include "donate.h"
 
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <climits>
@@ -63,6 +65,16 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
     if (!BaseConfig::read(reader, fileName)) {
         return false;
     }
+
+    // Runtime configuration replacement is intentionally unsupported by
+    // xmrig-proxy. Omitted `watch` is treated as disabled, while explicitly
+    // requesting it is a configuration error rather than being silently
+    // ignored.
+    if (reader.getBool(kWatch, false)) {
+        LOG_ERR("configuration hot reload is disabled; set watch=false and restart the proxy after changes");
+        return false;
+    }
+    m_watch = false;
 
     m_customDiffStats = reader.getBool("custom-diff-stats", m_customDiffStats);
     m_debug        = reader.getBool("debug", m_debug);
@@ -105,6 +117,10 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
             Json::getUint(randomXVerifier, "max-consecutive-rejections", m_randomXVerifierMaxConsecutiveRejections));
         m_randomXVerifierCandidateLimit = std::min<unsigned>(10000,
             Json::getUint(randomXVerifier, "candidate-max-per-minute", m_randomXVerifierCandidateLimit));
+        m_randomXVerifierGlobalCandidateLimit = std::min<unsigned>(100000,
+            Json::getUint(randomXVerifier, "candidate-global-max-per-minute", m_randomXVerifierGlobalCandidateLimit));
+        m_randomXVerifierEmergencyCandidateLimit = std::min<unsigned>(10000,
+            Json::getUint(randomXVerifier, "candidate-emergency-max-per-minute", m_randomXVerifierEmergencyCandidateLimit));
 
         if (m_randomXVerifierEnabled &&
             (m_randomXVerifierPath.isEmpty() || m_randomXVerifierPath.data()[0] != '/' ||
@@ -117,6 +133,47 @@ bool xmrig::Config::read(const IJsonReader &reader, const char *fileName)
     setCustomDiff(reader.getUint64("custom-diff", m_diff));
     setMode(reader.getString("mode"));
     setWorkersMode(reader.getValue("workers"));
+
+    m_soloMiningAddresses.clear();
+    for (const Pool &pool : m_pools.data()) {
+        if (!pool.isEnabled() || pool.mode() != Pool::MODE_DAEMON) {
+            continue;
+        }
+
+        const String expanded = Env::expand(pool.user());
+        const WalletAddress address(expanded);
+        const char *poolName = pool.url().data();
+
+        if (!address.isValid() || !address.coin().isValid()) {
+            LOG_ERR("daemon solo-mining pool \"%s\" has an invalid payout address", poolName);
+            return false;
+        }
+
+        if (address.type() != WalletAddress::PUBLIC) {
+            LOG_ERR("daemon solo-mining pool \"%s\" requires a primary payout address; %s addresses are not supported",
+                    poolName, address.typeName());
+            return false;
+        }
+
+        if (pool.coin().isValid() && address.coin() != pool.coin()) {
+            LOG_ERR("daemon solo-mining pool \"%s\" coin %s does not match payout address coin %s",
+                    poolName, pool.coin().name(), address.coin().name());
+            return false;
+        }
+
+        const auto duplicate = std::find_if(m_soloMiningAddresses.begin(), m_soloMiningAddresses.end(),
+            [&expanded](const WalletAddress &known) { return known.data() && expanded == known.data(); });
+        if (duplicate == m_soloMiningAddresses.end()) {
+            m_soloMiningAddresses.emplace_back(address);
+        }
+    }
+
+#   ifndef XMRIG_FEATURE_HTTP
+    if (!m_soloMiningAddresses.empty()) {
+        LOG_ERR("daemon solo mining requires a proxy build with HTTP support");
+        return false;
+    }
+#   endif
 
     if (m_randomXVerifierEnabled) {
         if (m_mode != SIMPLE_MODE) {
@@ -208,6 +265,8 @@ void xmrig::Config::getJSON(rapidjson::Document &doc) const
     randomXVerifier.AddMember("max-pending-per-miner", m_randomXVerifierMaxPendingPerMiner, allocator);
     randomXVerifier.AddMember("max-consecutive-rejections", m_randomXVerifierMaxConsecutiveRejections, allocator);
     randomXVerifier.AddMember("candidate-max-per-minute", m_randomXVerifierCandidateLimit, allocator);
+    randomXVerifier.AddMember("candidate-global-max-per-minute", m_randomXVerifierGlobalCandidateLimit, allocator);
+    randomXVerifier.AddMember("candidate-emergency-max-per-minute", m_randomXVerifierEmergencyCandidateLimit, allocator);
     doc.AddMember("randomx-verifier", randomXVerifier, allocator);
 
     Value bind(kArrayType);

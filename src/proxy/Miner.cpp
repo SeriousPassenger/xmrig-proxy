@@ -30,6 +30,9 @@
 #include "base/io/json/Json.h"
 #include "base/io/log/Log.h"
 #include "base/net/stratum/Job.h"
+#ifdef XMRIG_FEATURE_HTTP
+#   include "base/net/stratum/DaemonTemplateSource.h"
+#endif
 #include "base/net/tools/NetBuffer.h"
 #include "base/tools/Cvt.h"
 #include "base/tools/Chrono.h"
@@ -137,6 +140,7 @@ bool xmrig::Miner::accept(uv_stream_t *server)
 void xmrig::Miner::forwardJob(const Job &job, const char *algo)
 {
     m_diff = job.diff();
+    m_issuedDiff         = job.diff();
     m_currentJobId       = job.id();
     m_currentJobEntropy  = job.templateEntropy();
     m_jobHeight          = job.height();
@@ -150,7 +154,7 @@ void xmrig::Miner::forwardJob(const Job &job, const char *algo)
         return;
     }
 
-    rememberJob(job, job.rawBlob());
+    rememberJob(job, job.rawBlob(), m_issuedDiff);
 
     LiveEventStream::Row row("job_sent");
     if (job.templateSourceId()) {
@@ -169,12 +173,17 @@ void xmrig::Miner::forwardJob(const Job &job, const char *algo)
         row.templateAgeMs = Chrono::steadyMSecs() - job.templateFetchedMs();
     }
     row.height             = job.height();
+    row.prevHash           = job.templatePrevHash().data() ? job.templatePrevHash().data() : "";
     row.seedHash           = job.rawSeedHash().data() ? job.rawSeedHash().data() : "";
     row.algorithm          = algo ? algo : job.algorithm().name();
     row.jobId              = job.id().data() ? job.id().data() : "";
     row.entropyHex         = job.templateEntropy().data() ? job.templateEntropy().data() : "";
     row.minerTargetDiff    = diff();
     row.networkTargetDiff  = job.diff();
+    row.hashingBlob        = job.rawBlob() ? job.rawBlob() : "";
+    row.minerTargetHex     = job.rawTarget() ? job.rawTarget() : "";
+    row.nonceOffset        = job.nonceOffset();
+    row.nonceSize          = job.nonceSize();
     row.status             = "sent";
     LiveEventStream::publish(row);
 }
@@ -196,6 +205,7 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     }
 
     m_diff = job.diff();
+    m_issuedDiff         = job.diff();
     m_currentJobId       = job.id();
     m_currentJobEntropy  = job.templateEntropy();
     m_jobHeight          = job.height();
@@ -208,6 +218,12 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     if (m_customDiff && m_customDiff < m_diff) {
         const uint64_t t = 0xFFFFFFFFFFFFFFFFULL / m_customDiff;
         Cvt::toHex(m_sendBuf, 9, reinterpret_cast<const uint8_t *>(&t) + 4, 4);
+        const uint32_t compactTarget = static_cast<uint32_t>(t >> 32);
+        if (compactTarget != 0) {
+            const uint64_t expandedTarget = 0xFFFFFFFFFFFFFFFFULL /
+                (0xFFFFFFFFULL / static_cast<uint64_t>(compactTarget));
+            m_issuedDiff = Job::toDiff(expandedTarget);
+        }
         customDiff = true;
     }
 
@@ -234,11 +250,12 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
         blob = tmp_blob;
     }
 
-    if (!sendJob(blob, job.id().data(), customDiff ? m_sendBuf : job.rawTarget(), job.algorithm().name(), job.height(), job.rawSeedHash(), m_signatureData)) {
+    const std::string minerTargetHex = customDiff ? m_sendBuf : job.rawTarget();
+    if (!sendJob(blob, job.id().data(), minerTargetHex.c_str(), job.algorithm().name(), job.height(), job.rawSeedHash(), m_signatureData)) {
         return;
     }
 
-    rememberJob(job, blob);
+    rememberJob(job, blob, m_issuedDiff);
 
     LiveEventStream::Row row("job_sent");
     if (job.templateSourceId()) {
@@ -257,12 +274,23 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
         row.templateAgeMs = Chrono::steadyMSecs() - job.templateFetchedMs();
     }
     row.height             = job.height();
+    row.prevHash           = job.templatePrevHash().data() ? job.templatePrevHash().data() : "";
     row.seedHash           = job.rawSeedHash().data() ? job.rawSeedHash().data() : "";
     row.algorithm          = job.algorithm().name();
     row.jobId              = job.id().data() ? job.id().data() : "";
     row.entropyHex         = job.templateEntropy().data() ? job.templateEntropy().data() : "";
     row.minerTargetDiff    = diff();
     row.networkTargetDiff  = job.diff();
+    row.hashingBlob        = blob ? blob : "";
+    row.minerTargetHex     = minerTargetHex;
+    row.nonceOffset        = job.nonceOffset();
+    row.nonceSize          = job.nonceSize();
+    if (job.hasViewTag()) {
+        row.viewTag = m_viewTag;
+    }
+    if (extra_nonce >= 0) {
+        row.extraNonce = extra_nonce;
+    }
     row.status             = "sent";
     LiveEventStream::publish(row);
 }
@@ -306,7 +334,7 @@ const xmrig::Miner::TelemetryJob *xmrig::Miner::findTelemetryJob(const String &i
 }
 
 
-void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob)
+void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob, uint64_t issuedDiff)
 {
     static constexpr size_t kTelemetryJobCount = 6;
 
@@ -315,11 +343,12 @@ void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob)
     telemetry.entropy            = job.templateEntropy();
     telemetry.hashingBlob        = hashingBlob;
     telemetry.id                 = job.id();
+    telemetry.prevHash           = job.templatePrevHash();
     telemetry.seedHash           = job.rawSeedHash();
     telemetry.signatureData      = m_signatureData;
     telemetry.height             = job.height();
     telemetry.issuedAt           = Chrono::steadyMSecs();
-    telemetry.minerDiff          = diff();
+    telemetry.minerDiff          = issuedDiff;
     telemetry.networkDiff        = job.diff();
     telemetry.issuanceToken      = ++m_jobIssuanceSequence;
     telemetry.templateGeneration = job.templateGeneration();
@@ -329,6 +358,7 @@ void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob)
     telemetry.extraNonce         = m_extraNonce;
 
     m_telemetryJobs.push_front(std::move(telemetry));
+    m_currentPrevHash = job.templatePrevHash();
     while (m_telemetryJobs.size() > kTelemetryJobCount) {
         m_telemetryJobs.pop_back();
     }
@@ -357,23 +387,42 @@ bool xmrig::Miner::rememberSubmission(const char *jobId, const char *nonce)
             m_seenSubmissions.size() >= kMaxRememberedSubmissions)) {
         const SeenSubmission &oldest = m_seenSubmissions.front();
         auto it = m_seenSubmissionTimes.find(oldest.key);
-        if (it != m_seenSubmissionTimes.end() && it->second == oldest.seenAt) {
+        if (it != m_seenSubmissionTimes.end() && it->second.token == oldest.token) {
             m_seenSubmissionTimes.erase(it);
         }
         m_seenSubmissions.pop_front();
     }
 
     auto existing = m_seenSubmissionTimes.find(key);
-    if (existing != m_seenSubmissionTimes.end() && now < existing->second + kSubmissionTtl) {
+    if (existing != m_seenSubmissionTimes.end() && now < existing->second.seenAt + kSubmissionTtl) {
         return false;
     }
 
     SeenSubmission seen;
     seen.key = key;
     seen.seenAt = now;
+    seen.token = ++m_submissionSequence;
     m_seenSubmissions.push_back(seen);
-    m_seenSubmissionTimes[key] = now;
+    SeenSubmissionStamp &stamp = m_seenSubmissionTimes[key];
+    stamp.seenAt = now;
+    stamp.token = seen.token;
     return true;
+}
+
+
+void xmrig::Miner::forgetSubmission(const char *jobId, const char *nonce)
+{
+    if (!jobId || !nonce) {
+        return;
+    }
+
+    std::string key(jobId);
+    key.push_back(':');
+    key.append(nonce);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    m_seenSubmissionTimes.erase(key);
 }
 
 
@@ -393,7 +442,7 @@ void xmrig::Miner::fillSubmitMetadata(SubmitEvent *event, const PendingShare &sh
 }
 
 
-bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job)
+bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job, bool candidateFallback)
 {
     RandomXVerifier *verifier = RandomXVerifier::instance();
     if (!event || !verifier || job.algorithm != Algorithm::RX_0 ||
@@ -416,10 +465,12 @@ bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job
     share->verificationGeneration = m_verificationGeneration;
     share->templateGeneration = job.templateGeneration;
     share->templateSourceId = job.templateSourceId;
+    share->candidateFallback = candidateFallback;
     share->jobId = event->request.jobId.data() ? event->request.jobId.data() : "";
     share->nonce = event->request.nonce ? event->request.nonce : "";
     share->claimedHash = event->request.result ? event->request.result : "";
     share->hashingBlob = job.hashingBlob.data();
+    share->prevHash = job.prevHash.data() ? job.prevHash.data() : "";
     share->seedHash = job.seedHash.data();
     share->signature = event->request.sig ? event->request.sig : "";
     share->signatureData = event->request.sig_data ? event->request.sig_data : "";
@@ -435,6 +486,7 @@ bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job
     request.claimedHash = share->claimedHash;
     request.jobId = share->jobId;
     request.nonce = share->nonce;
+    request.priority = candidateFallback;
 
     const uintptr_t key = m_key;
     const bool queued = verifier->verify(request, [key, share](const RandomXVerifier::Result &result) {
@@ -452,6 +504,8 @@ bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job
         return false;
     }
 
+    recordInfrastructureOutcome(true);
+
     LiveEventStream::Row row("verify_requested");
     row.minerId = m_id;
     row.mapperId = m_mapperId;
@@ -462,6 +516,7 @@ bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job
     row.sourceId = share->templateSourceId;
     row.templateId = std::to_string(share->templateGeneration);
     row.height = share->height;
+    row.prevHash = share->prevHash;
     row.seedHash = share->seedHash;
     row.algorithm = share->algorithm.name();
     row.jobId = share->jobId;
@@ -472,14 +527,14 @@ bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job
     row.minerRequestId = share->requestId;
     row.nonce = share->nonce;
     row.resultHash = share->claimedHash;
-    row.status = "requested";
+    row.status = candidateFallback ? "candidate_rate_limited" : "requested";
     LiveEventStream::publish(row);
 
     return true;
 }
 
 
-void xmrig::Miner::rejectPendingShare(const PendingShare &share, Error::Code error)
+void xmrig::Miner::rejectPendingShare(const PendingShare &share, Error::Code error, bool countStrike)
 {
     SubmitEvent *event = SubmitEvent::create(this, share.requestId, share.jobId.c_str(), share.nonce.c_str(),
         share.claimedHash.c_str(), share.algorithm, share.signature.empty() ? nullptr : share.signature.c_str(),
@@ -489,7 +544,9 @@ void xmrig::Miner::rejectPendingShare(const PendingShare &share, Error::Code err
     event->setError(error);
     event->start();
     replyWithError(share.requestId, Error::toString(error));
-    recordShareOutcome(false);
+    if (countStrike) {
+        recordShareOutcome(false);
+    }
 }
 
 
@@ -516,6 +573,7 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
     row.sourceId = share->templateSourceId;
     row.templateId = std::to_string(share->templateGeneration);
     row.height = share->height;
+    row.prevHash = share->prevHash;
     row.seedHash = share->seedHash;
     row.algorithm = share->algorithm.name();
     row.jobId = share->jobId;
@@ -530,10 +588,69 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
     row.latencyMs = result.latencyMs;
     row.status = result.ok ? "computed" : "error";
     row.errorMessage = result.error;
+    row.verifierQueueMs = result.queueMs;
+    row.verifierHashMs = result.hashMs;
+    row.verifierTotalMs = result.totalMs;
 
     if (!result.ok) {
         LiveEventStream::publish(row);
-        return rejectPendingShare(*share, Error::VerificationFailed);
+        if (share->candidateFallback) {
+            // This request was already classified as a claimed network
+            // candidate. Verification was only the over-budget abuse guard;
+            // an unavailable sidecar must not make us discard a possible
+            // block after accepting the request. Monerod reconstructs and
+            // validates the exact job+nonce and remains authoritative.
+            RandomXVerifier *verifier = RandomXVerifier::instance();
+            if (!verifier || !verifier->allowEmergencyCandidate(m_key)) {
+                row.event = "candidate_verify_fallback";
+                row.status = "emergency_rate_limited";
+                row.errorMessage = "candidate verification failed and emergency direct-submit budget is exhausted";
+                LiveEventStream::publish(row);
+                // No verifier or daemon accepted ownership. Preserve the
+                // connection-local strike for repeated candidate abuse, but
+                // let a genuine nonce be retried after capacity recovers.
+                forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
+                return rejectPendingShare(*share, Error::CandidateRateLimit);
+            }
+
+            LiveEventStream::Row fallback = row;
+            fallback.event = "candidate_verify_fallback";
+            fallback.status = "direct_after_verifier_error";
+            fallback.resultHash = share->claimedHash;
+            LiveEventStream::publish(fallback);
+
+            SubmitEvent *event = SubmitEvent::create(this, share->requestId, share->jobId.c_str(),
+                share->nonce.c_str(), share->claimedHash.c_str(), share->algorithm,
+                share->signature.empty() ? nullptr : share->signature.c_str(),
+                share->signatureData.empty() ? nullptr : share->signatureData.c_str(),
+                share->commitment.empty() ? nullptr : share->commitment.c_str(),
+                share->viewTag, share->extraNonce);
+            fillSubmitMetadata(event, *share);
+            Error::Code finalError = event->error();
+            event->setErrorSink(&finalError);
+            if (!event->start()) {
+                forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
+                replyWithError(share->requestId, Error::toString(finalError));
+                if (finalError == Error::BadGateway || finalError == Error::VerificationFailed) {
+                    recordInfrastructureOutcome(false);
+                }
+                else {
+                    recordShareOutcome(false);
+                }
+            }
+            else {
+                recordInfrastructureOutcome(true);
+            }
+            return;
+        }
+        // The sidecar failed after accepting this request. This is an
+        // infrastructure failure, not evidence of a bad miner: allow the
+        // exact share to be retried and do not advance the connection's
+        // rejection-strike counter.
+        forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
+        rejectPendingShare(*share, Error::VerificationFailed, false);
+        recordInfrastructureOutcome(false);
+        return;
     }
 
     uint8_t claimed[32];
@@ -549,6 +666,45 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
                        share->extraNonce);
     row.shareDiff = verified.actualDiff();
 
+    // The independently computed hash is authoritative. If it solves the
+    // network target, preserve the block even when the miner supplied a
+    // different claimed result. Monerod remains the final consensus check.
+    const bool computedCandidate = share->networkDiff != 0 && verified.actualDiff() != 0 &&
+        verified.actualDiff() >= share->networkDiff;
+    if (computedCandidate) {
+        if (!exact) {
+            row.event = "verify_mismatch";
+            row.status = "candidate_escalated";
+            row.errorMessage = std::string("claimed=") + share->claimedHash + " computed=" + result.hash;
+        }
+        else {
+            row.status = "candidate";
+        }
+        LiveEventStream::publish(row);
+
+        SubmitEvent *event = SubmitEvent::create(this, share->requestId, share->jobId.c_str(), share->nonce.c_str(),
+            result.hash.c_str(), share->algorithm, share->signature.empty() ? nullptr : share->signature.c_str(),
+            share->signatureData.empty() ? nullptr : share->signatureData.c_str(),
+            share->commitment.empty() ? nullptr : share->commitment.c_str(), share->viewTag, share->extraNonce);
+        fillSubmitMetadata(event, *share);
+        Error::Code finalError = event->error();
+        event->setErrorSink(&finalError);
+        if (!event->start()) {
+            forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
+            replyWithError(share->requestId, Error::toString(finalError));
+            if (finalError == Error::BadGateway || finalError == Error::VerificationFailed) {
+                recordInfrastructureOutcome(false);
+            }
+            else {
+                recordShareOutcome(false);
+            }
+        }
+        else {
+            recordInfrastructureOutcome(true);
+        }
+        return;
+    }
+
     if (!exact) {
         row.event = "verify_mismatch";
         row.status = "mismatch";
@@ -563,24 +719,6 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
         return rejectPendingShare(*share, Error::LowDifficulty);
     }
 
-    if (verified.actualDiff() >= share->networkDiff) {
-        row.status = "candidate";
-        LiveEventStream::publish(row);
-
-        SubmitEvent *event = SubmitEvent::create(this, share->requestId, share->jobId.c_str(), share->nonce.c_str(),
-            result.hash.c_str(), share->algorithm, share->signature.empty() ? nullptr : share->signature.c_str(),
-            share->signatureData.empty() ? nullptr : share->signatureData.c_str(),
-            share->commitment.empty() ? nullptr : share->commitment.c_str(), share->viewTag, share->extraNonce);
-        fillSubmitMetadata(event, *share);
-        Error::Code finalError = event->error();
-        event->setErrorSink(&finalError);
-        if (!event->start()) {
-            replyWithError(share->requestId, Error::toString(finalError));
-            recordShareOutcome(false);
-        }
-        return;
-    }
-
     if (share->minerDiff >= share->networkDiff) {
         row.status = "low_difficulty";
         LiveEventStream::publish(row);
@@ -593,7 +731,8 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
 
     SubmitResult accepted(0, share->networkDiff, verified.actualDiff(), share->requestId, 0,
                           share->shareId, String(share->jobId.c_str()), share->templateGeneration,
-                          share->height, String(share->entropy.c_str()), share->templateSourceId);
+                          share->height, String(share->entropy.c_str()), share->templateSourceId,
+                          share->minerDiff);
     AcceptEvent::start(static_cast<size_t>(share->mapperId), this, accepted, false, true);
     recordShareOutcome(true);
 }
@@ -601,13 +740,14 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
 
 void xmrig::Miner::recordShareOutcome(bool accepted)
 {
-    RandomXVerifier *verifier = RandomXVerifier::instance();
-    if (!verifier) {
+    if (accepted) {
+        m_consecutiveInfrastructureFailures = 0;
+        m_consecutiveShareRejections = 0;
         return;
     }
 
-    if (accepted) {
-        m_consecutiveShareRejections = 0;
+    RandomXVerifier *verifier = RandomXVerifier::instance();
+    if (!verifier) {
         return;
     }
 
@@ -625,6 +765,24 @@ void xmrig::Miner::recordShareOutcome(bool accepted)
 }
 
 
+void xmrig::Miner::recordInfrastructureOutcome(bool healthy)
+{
+    static constexpr uint32_t kMaxConsecutiveInfrastructureFailures = 16;
+
+    if (healthy) {
+        m_consecutiveInfrastructureFailures = 0;
+        return;
+    }
+
+    ++m_consecutiveInfrastructureFailures;
+    if (m_consecutiveInfrastructureFailures >= kMaxConsecutiveInfrastructureFailures) {
+        LOG_WARN("closing miner connection %lld after %u consecutive verifier/daemon infrastructure failures",
+                 static_cast<long long>(m_id), m_consecutiveInfrastructureFailures);
+        shutdown(false);
+    }
+}
+
+
 bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson::Value &params)
 {
     if (!method || !params.IsObject()) {
@@ -633,6 +791,28 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
 
     if (m_state == WaitLoginState) {
         if (strcmp(method, "login") == 0) {
+            const auto loginString = [&params](const char *name, size_t maxSize, bool required) -> const char * {
+                if (!params.HasMember(name)) {
+                    return required ? nullptr : "";
+                }
+
+                const rapidjson::Value &value = params[name];
+                if (!value.IsString() || value.GetStringLength() > maxSize ||
+                    strlen(value.GetString()) != value.GetStringLength()) {
+                    return nullptr;
+                }
+
+                return value.GetString();
+            };
+
+            const char *login = loginString("login", 256, true);
+            const char *password = loginString("pass", 1024, true);
+            const char *agent = loginString("agent", 512, false);
+            const char *rigId = loginString("rigid", 256, false);
+            if (!login || !password || !agent || !rigId) {
+                return false;
+            }
+
             setState(WaitReadyState);
             // A fail-closed RandomX verifier may need to build the first
             // full-memory dataset before upstream can safely issue a job.
@@ -652,6 +832,10 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
                     algorithms.reserve(value.Size());
 
                     for (const auto &i : value.GetArray()) {
+                        if (!i.IsString() || strlen(i.GetString()) != i.GetStringLength()) {
+                            continue;
+                        }
+
                         const Algorithm algo(i.GetString());
                         if (!algo.isValid()) {
                             continue;
@@ -662,10 +846,10 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
                 }
             }
 
-            m_user     = Json::getString(params, "login");
-            m_password = Json::getString(params, "pass");
-            m_agent    = Json::getString(params, "agent");
-            m_rigId    = Json::getString(params, "rigid");
+            m_user     = login;
+            m_password = password;
+            m_agent    = agent;
+            m_rigId    = rigId;
 
             LoginEvent::create(this, id, algorithms, params)->start();
             return true;
@@ -681,21 +865,44 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
     if (strcmp(method, "submit") == 0) {
         heartbeat();
 
-        const char *rpcId = Json::getString(params, "id");
+        const auto strictString = [&params](const char *name) -> const char * {
+            if (!params.HasMember(name) || !params[name].IsString()) {
+                return nullptr;
+            }
+
+            const rapidjson::Value &value = params[name];
+            return strlen(value.GetString()) == value.GetStringLength()
+                ? value.GetString() : nullptr;
+        };
+
+        const char *rpcId = strictString("id");
         if (!rpcId || m_rpcId != rpcId) {
             replyWithError(id, Error::toString(Error::Unauthenticated));
             return true;
         }
 
-        Algorithm algorithm(Json::getString(params, "algo"));
-        const char *submittedJobId = Json::getString(params, "job_id");
+        const char *algorithmName = strictString("algo");
+        Algorithm algorithm(algorithmName);
+        bool invalidAlgorithmField = false;
+        if (params.HasMember("algo")) {
+            const rapidjson::Value &value = params["algo"];
+            invalidAlgorithmField = !value.IsString() ||
+                strlen(value.GetString()) != value.GetStringLength() ||
+                (value.GetStringLength() != 0 && !algorithm.isValid());
+        }
+        const char *submittedJobId = strictString("job_id");
+        const char *nonce = strictString("nonce");
+        const char *resultHash = strictString("result");
+        const char *signature = strictString("sig");
+        const char *commitment = strictString("commitment");
         const String submittedJob(submittedJobId);
         const TelemetryJob *telemetryJob = findTelemetryJob(submittedJob);
         const String &signatureData = telemetryJob ? telemetryJob->signatureData : m_signatureData;
         const uint8_t viewTag = telemetryJob ? telemetryJob->viewTag : m_viewTag;
         const int64_t extraNonce = telemetryJob ? telemetryJob->extraNonce : m_extraNonce;
 
-        SubmitEvent *event = SubmitEvent::create(this, id, submittedJobId, Json::getString(params, "nonce"), Json::getString(params, "result"), algorithm, Json::getString(params, "sig"), signatureData, Json::getString(params, "commitment"), viewTag, extraNonce);
+        SubmitEvent *event = SubmitEvent::create(this, id, submittedJobId, nonce, resultHash,
+            algorithm, signature, signatureData, commitment, viewTag, extraNonce);
         Error::Code finalError = event->error();
         event->setErrorSink(&finalError);
         event->request.shareId = ++s_shareSequence;
@@ -724,6 +931,16 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         row.minerRequestId     = event->request.id;
         row.nonce              = event->request.nonce ? event->request.nonce : "";
         row.resultHash         = event->request.result ? event->request.result : "";
+        if (telemetryJob) {
+            row.prevHash       = telemetryJob->prevHash.data() ? telemetryJob->prevHash.data() : "";
+            row.seedHash       = telemetryJob->seedHash.data() ? telemetryJob->seedHash.data() : "";
+            row.algorithm      = telemetryJob->algorithm.name();
+        }
+        row.signatureHex       = event->request.sig ? event->request.sig : "";
+        row.viewTag            = event->request.view_tag;
+        if (event->request.extra_nonce >= 0) {
+            row.extraNonce = event->request.extra_nonce;
+        }
         if (event->request.minerDiff) {
             row.minerTargetDiff = event->request.minerDiff;
         }
@@ -744,27 +961,40 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
 
         uint8_t nonceBytes[4];
         uint8_t resultBytes[32];
-        const bool validEncoding = event->request.nonce && event->request.result &&
+        const bool validNonceEncoding = event->request.nonce &&
             strlen(event->request.nonce) == sizeof(nonceBytes) * 2 &&
+            Cvt::fromHex(nonceBytes, sizeof(nonceBytes), event->request.nonce, sizeof(nonceBytes) * 2);
+        const bool validResultEncoding = event->request.result &&
             strlen(event->request.result) == sizeof(resultBytes) * 2 &&
-            Cvt::fromHex(nonceBytes, sizeof(nonceBytes), event->request.nonce, sizeof(nonceBytes) * 2) &&
             Cvt::fromHex(resultBytes, sizeof(resultBytes), event->request.result, sizeof(resultBytes) * 2);
 
         RandomXVerifier *verifier = RandomXVerifier::instance();
-        const bool claimedCandidate = telemetryJob &&
+        const bool claimedCandidate = telemetryJob && telemetryJob->networkDiff != 0 &&
             event->request.actualDiff() >= telemetryJob->networkDiff;
-
-        if (!event->request.isValid() || !validEncoding) {
-            event->setError(Error::LowDifficulty);
+        bool staleJob = telemetryJob && !telemetryJob->prevHash.isEmpty() &&
+            !m_currentPrevHash.isEmpty() && telemetryJob->prevHash != m_currentPrevHash;
+#       ifdef XMRIG_FEATURE_HTTP
+        if (!staleJob && telemetryJob) {
+            staleJob = !DaemonTemplateSource::isCurrentTip(telemetryJob->templateSourceId,
+                                                            telemetryJob->prevHash);
         }
-        else if (!telemetryJob) {
+#       endif
+
+        if (!submittedJobId || !telemetryJob) {
             event->setError(Error::InvalidJobId);
         }
-        else if (event->request.algorithm.isValid() && event->request.algorithm != telemetryJob->algorithm) {
+        else if (!validNonceEncoding) {
+            event->setError(Error::InvalidNonce);
+        }
+        else if (!validResultEncoding) {
+            event->setError(Error::InvalidResult);
+        }
+        else if (invalidAlgorithmField ||
+                 (event->request.algorithm.isValid() && event->request.algorithm != telemetryJob->algorithm)) {
             event->setError(Error::IncorrectAlgorithm);
         }
-        else if (!rememberSubmission(event->request.jobId.data(), event->request.nonce)) {
-            event->setError(Error::DuplicateShare);
+        else if (staleJob) {
+            event->setError(Error::StaleShare);
         }
         else if (!verifier && event->request.actualDiff() < telemetryJob->minerDiff) {
             event->setError(Error::LowDifficulty);
@@ -772,14 +1002,16 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         else if (hasExtension(EXT_NICEHASH) && !event->request.isCompatible(m_fixedByte)) {
             event->setError(Error::InvalidNonce);
         }
-
-        if (event->error() == Error::NoError && verifier && claimedCandidate &&
-            !verifier->allowCandidate(m_key)) {
-            event->setError(Error::CandidateRateLimit);
+        else if (!rememberSubmission(event->request.jobId.data(), event->request.nonce)) {
+            event->setError(Error::DuplicateShare);
         }
 
-        if (event->error() == Error::NoError && verifier && !claimedCandidate) {
-            if (startVerification(event, *telemetryJob)) {
+        const bool candidateNeedsVerification = event->error() == Error::NoError && verifier &&
+            claimedCandidate && !verifier->allowCandidate(m_key);
+
+        if (event->error() == Error::NoError && verifier &&
+            (!claimedCandidate || candidateNeedsVerification)) {
+            if (startVerification(event, *telemetryJob, candidateNeedsVerification)) {
                 // The verifier request owns all share fields. SubmitEvent uses
                 // the process-wide placement buffer and cannot survive the
                 // asynchronous Unix-socket round trip.
@@ -787,7 +1019,8 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
                 return true;
             }
 
-            LiveEventStream::Row verifyError("verify_error");
+            LiveEventStream::Row verifyError(candidateNeedsVerification
+                ? "candidate_verify_fallback" : "verify_error");
             verifyError.minerId = m_id;
             verifyError.mapperId = m_mapperId;
             verifyError.sourceId = event->request.templateSourceId;
@@ -799,10 +1032,27 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
             verifyError.minerRequestId = event->request.id;
             verifyError.nonce = event->request.nonce ? event->request.nonce : "";
             verifyError.resultHash = event->request.result ? event->request.result : "";
-            verifyError.status = "unavailable";
-            verifyError.errorMessage = "verifier not ready, seed not ready, or queue full";
+            if (!candidateNeedsVerification) {
+                verifyError.status = "unavailable";
+                verifyError.errorMessage = "verifier not ready, seed not ready, or queue full";
+                event->setError(Error::VerificationFailed);
+            }
+            else if (!verifier->allowEmergencyCandidate(m_key)) {
+                verifyError.status = "emergency_rate_limited";
+                verifyError.errorMessage = "candidate verification admission unavailable and emergency direct-submit budget is exhausted";
+                event->setError(Error::CandidateRateLimit);
+            }
+            else {
+                verifyError.status = "direct_unverified";
+                verifyError.errorMessage = "candidate verification admission unavailable; using bounded emergency direct submit";
+            }
             LiveEventStream::publish(verifyError);
-            event->setError(Error::VerificationFailed);
+            if (event->error() != Error::NoError) {
+                // Admission failed before either verifier or daemon accepted
+                // ownership. Let the miner retry the same genuine nonce after
+                // the transient condition clears.
+                forgetSubmission(event->request.jobId.data(), event->request.nonce);
+            }
         }
 
         if (event->error() == Error::NoError &&
@@ -814,7 +1064,8 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
             SubmitResult result = SubmitResult(0, event->request.networkDiff, event->request.actualDiff(), event->request.id, 0,
                                                event->request.shareId, event->request.jobId,
                                                event->request.templateGeneration, event->request.height,
-                                               event->request.templateEntropy, event->request.templateSourceId);
+                                               event->request.templateEntropy, event->request.templateSourceId,
+                                               event->request.minerDiff);
 
             // SubmitEvent lives in the global placement buffer. It is not
             // dispatched on this local custom-difficulty path, so destroy it
@@ -826,8 +1077,23 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         }
 
         if (!event->start()) {
+            const bool infrastructureFailure = finalError == Error::BadGateway ||
+                finalError == Error::VerificationFailed;
+            if (infrastructureFailure) {
+                // SubmitEvent has been destroyed by Events::exec at this
+                // point; use the still-owned request strings instead.
+                forgetSubmission(submittedJobId, nonce);
+            }
             replyWithError(id, Error::toString(finalError));
-            recordShareOutcome(false);
+            if (infrastructureFailure) {
+                recordInfrastructureOutcome(false);
+            }
+            else {
+                recordShareOutcome(false);
+            }
+        }
+        else {
+            recordInfrastructureOutcome(true);
         }
 
         return finalError != Error::InvalidNonce;
@@ -889,7 +1155,7 @@ void xmrig::Miner::parse(char *line, size_t len)
     }
 
     rapidjson::Document doc;
-    if (doc.ParseInsitu(line).HasParseError()) {
+    if (doc.ParseInsitu<rapidjson::kParseValidateEncodingFlag>(line).HasParseError()) {
         LOG_ERR("[%s] JSON decode failed: \"%s\"", m_ip, rapidjson::GetParseError_En(doc.GetParseError()));
 
         return shutdown(true);
@@ -899,8 +1165,18 @@ void xmrig::Miner::parse(char *line, size_t len)
         return shutdown(true);
     }
 
-    const rapidjson::Value &id = doc["id"];
-    if (id.IsInt64() && parseRequest(id.GetInt64(), doc["method"].GetString(), doc["params"])) {
+    if (!doc.HasMember("id") || !doc["id"].IsInt64() ||
+        !doc.HasMember("method") || !doc["method"].IsString() ||
+        !doc.HasMember("params") || !doc["params"].IsObject()) {
+        return shutdown(true);
+    }
+
+    const rapidjson::Value &method = doc["method"];
+    if (strlen(method.GetString()) != method.GetStringLength()) {
+        return shutdown(true);
+    }
+
+    if (parseRequest(doc["id"].GetInt64(), method.GetString(), doc["params"])) {
         return;
     }
 
@@ -930,10 +1206,14 @@ void xmrig::Miner::read(ssize_t nread, const uv_buf_t *buf)
     }
     else
     {
-        m_reader.parse(buf->base, size);
+        if (!m_reader.parse(buf->base, size)) {
+            shutdown(true);
+        }
     }
 #   else
-    m_reader.parse(buf->base, size);
+    if (!m_reader.parse(buf->base, size)) {
+        shutdown(true);
+    }
 #   endif
 }
 

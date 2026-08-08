@@ -81,10 +81,13 @@ public:
     inline void clearTelemetryJobs()
     {
         m_telemetryJobs.clear();
+        m_currentPrevHash = nullptr;
+        m_issuedDiff = 0;
         ++m_verificationGeneration;
     }
     void forwardJob(const Job &job, const char *algo);
     void replyWithError(int64_t id, const char *message);
+    void recordInfrastructureOutcome(bool healthy);
     void recordShareOutcome(bool accepted);
     void setJob(Job &job, int64_t extra_nonce = -1);
     void success(int64_t id, const char *status);
@@ -103,7 +106,7 @@ public:
     inline State state() const                                    { return m_state; }
     inline uint16_t localPort() const                             { return m_localPort; }
     inline uint64_t customDiff() const                            { return m_customDiff; }
-    inline uint64_t diff() const                                  { return (m_customDiff ? std::min(m_customDiff, m_diff) : m_diff); }
+    inline uint64_t diff() const                                  { return m_issuedDiff ? m_issuedDiff : (m_customDiff ? std::min(m_customDiff, m_diff) : m_diff); }
     inline uint64_t jobHeight() const                             { return m_jobHeight; }
     inline uint64_t networkDiff() const                           { return m_diff; }
     inline uint64_t templateGeneration() const                    { return m_templateGeneration; }
@@ -131,6 +134,7 @@ private:
         String entropy;
         String hashingBlob;
         String id;
+        String prevHash;
         String seedHash;
         String signatureData;
         uint64_t height = 0;
@@ -160,10 +164,12 @@ private:
         uint64_t verificationGeneration = 0;
         uint64_t templateGeneration = 0;
         uint64_t templateSourceId = 0;
+        bool candidateFallback = false;
         std::string jobId;
         std::string nonce;
         std::string claimedHash;
         std::string hashingBlob;
+        std::string prevHash;
         std::string seedHash;
         std::string signature;
         std::string signatureData;
@@ -175,21 +181,29 @@ private:
     {
         std::string key;
         uint64_t seenAt = 0;
+        uint64_t token = 0;
+    };
+
+    struct SeenSubmissionStamp
+    {
+        uint64_t seenAt = 0;
+        uint64_t token = 0;
     };
 
     constexpr static size_t kLoginTimeout  = 10 * 1000;
     constexpr static size_t kSocketTimeout = 60 * 10 * 1000;
 
     bool isWritable() const;
+    void forgetSubmission(const char *jobId, const char *nonce);
     bool rememberSubmission(const char *jobId, const char *nonce);
-    bool startVerification(SubmitEvent *event, const TelemetryJob &job);
+    bool startVerification(SubmitEvent *event, const TelemetryJob &job, bool candidateFallback = false);
     void completeVerification(const std::shared_ptr<PendingShare> &share, const RandomXVerifier::Result &result);
     void fillSubmitMetadata(SubmitEvent *event, const PendingShare &share) const;
     bool writeRaw(const char *data, size_t size);
     const TelemetryJob *findTelemetryJob(const String &id) const;
     bool parseRequest(int64_t id, const char *method, const rapidjson::Value &params);
-    void rememberJob(const Job &job, const char *hashingBlob);
-    void rejectPendingShare(const PendingShare &share, Error::Code error);
+    void rememberJob(const Job &job, const char *hashingBlob, uint64_t issuedDiff);
+    void rejectPendingShare(const PendingShare &share, Error::Code error, bool countStrike = true);
     bool send(BIO *bio);
     void heartbeat();
     void parse(char *line, size_t len);
@@ -222,26 +236,30 @@ private:
     String m_agent;
     String m_currentJobEntropy;
     String m_currentJobId;
+    String m_currentPrevHash;
     String m_password;
     String m_rigId;
     String m_user;
     String m_signatureData;
     std::deque<TelemetryJob> m_telemetryJobs;
     std::deque<SeenSubmission> m_seenSubmissions;
-    std::unordered_map<std::string, uint64_t> m_seenSubmissionTimes;
+    std::unordered_map<std::string, SeenSubmissionStamp> m_seenSubmissionTimes;
     uint8_t m_viewTag       = 0;
     Tls *m_tls              = nullptr;
     uint16_t m_localPort;
     uint64_t m_customDiff   = 0;
     uint64_t m_diff         = 0;
+    uint64_t m_issuedDiff   = 0;
     uint64_t m_jobHeight    = 0;
     uint64_t m_expire;
     uint64_t m_rx           = 0;
     uint64_t m_timestamp;
     uint64_t m_jobIssuanceSequence = 0;
+    uint64_t m_submissionSequence = 0;
     uint64_t m_templateGeneration = 0;
     uint64_t m_tx           = 0;
     uint64_t m_verificationGeneration = 0;
+    uint32_t m_consecutiveInfrastructureFailures = 0;
     uint32_t m_consecutiveShareRejections = 0;
     uint8_t m_fixedByte     = 0;
     int64_t m_extraNonce    = -1;

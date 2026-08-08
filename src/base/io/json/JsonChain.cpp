@@ -50,8 +50,13 @@ bool xmrig::JsonChain::addFile(const char *fileName)
     Document doc;
     if (Json::get(fileName, doc)) {
         m_fileName = fileName;
+        const bool added = add(std::move(doc));
+        if (!added) {
+            m_fileError = true;
+            LOG_ERR("configuration file \"%s\" must contain a non-empty JSON object", fileName);
+        }
 
-        return add(std::move(doc));
+        return added;
     }
 
     if (doc.HasParseError()) {
@@ -82,6 +87,8 @@ bool xmrig::JsonChain::addFile(const char *fileName)
     else {
         LOG_ERR("unable to open \"%s\".", fileName);
     }
+
+    m_fileError = true;
 
     return false;
 }

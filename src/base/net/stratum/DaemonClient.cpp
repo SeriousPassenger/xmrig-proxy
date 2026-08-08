@@ -14,6 +14,7 @@
 
 #include "3rdparty/rapidjson/document.h"
 #include "3rdparty/rapidjson/error/en.h"
+#include "base/crypto/keccak.h"
 #include "base/io/json/Json.h"
 #include "base/io/json/JsonRequest.h"
 #include "base/io/log/Log.h"
@@ -35,6 +36,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <uv.h>
 
 
 namespace xmrig {
@@ -48,7 +50,25 @@ static const char *kSubmitTag = "daemon-submit";
 static constexpr size_t kEntropySize = 16;
 static constexpr size_t kJobHistorySize = 6;
 static constexpr uint64_t kJobHistoryMs = 120000;
-static const int kHttpSubmit = 0x445403;
+static const int kHttpSubmit    = 0x445403;
+static const int kHttpReconcile = 0x445404;
+
+
+bool jsonString(const rapidjson::Value &object, const char *key, std::string &out)
+{
+    out.clear();
+    if (!object.IsObject() || !key) {
+        return false;
+    }
+
+    const auto member = object.FindMember(key);
+    if (member == object.MemberEnd() || !member->value.IsString()) {
+        return false;
+    }
+
+    out.assign(member->value.GetString(), member->value.GetStringLength());
+    return out.find('\0') == std::string::npos;
+}
 
 
 } // namespace
@@ -63,6 +83,7 @@ DaemonClient::DaemonClient(int id, IClientListener *listener) :
 
 DaemonClient::~DaemonClient()
 {
+    m_destroying = true;
     disconnect();
 }
 
@@ -75,6 +96,24 @@ void DaemonClient::deleteLater()
 
 bool DaemonClient::disconnect()
 {
+    // A live strategy disconnect (for example failover) must complete every
+    // accepted downstream request exactly once. Object destruction is the one
+    // exception: its listener graph may already be tearing down, so only
+    // telemetry is safe there.
+    if (!m_destroying) {
+        while (!m_pendingSubmissions.empty()) {
+            finalizeSubmission(m_pendingSubmissions.begin()->first, SubmitResult::Outcome::Ambiguous,
+                               "daemon client disconnected before submitblock outcome was known");
+        }
+    }
+    else {
+        for (const auto &entry : m_pendingSubmissions) {
+            publishSubmissionRow("submit_block_result", entry.second, entry.first, "ambiguous",
+                                 "daemon client destroyed before submitblock outcome was known",
+                                 0, nullptr, true);
+        }
+    }
+
     if (m_source) {
         m_source->unsubscribe(this);
         m_source.reset();
@@ -82,6 +121,7 @@ bool DaemonClient::disconnect()
 
     m_contexts.clear();
     m_pendingSnapshot.reset();
+    m_pendingSubmissions.clear();
     m_results.clear();
     m_httpListener.reset();
     m_job.reset();
@@ -167,6 +207,11 @@ void DaemonClient::onDaemonTemplate(const std::shared_ptr<const DaemonTemplateSo
     }
 
     if (RandomXVerifier::instance()) {
+        RandomXVerifier::instance()->setSeedRoles(
+            snapshot->sourceId,
+            snapshot->previousSeedHash.data() ? snapshot->previousSeedHash.data() : "",
+            snapshot->seedHash.data() ? snapshot->seedHash.data() : "",
+            snapshot->nextSeedHash.data() ? snapshot->nextSeedHash.data() : "");
         RandomXVerifier::instance()->prepareSeed(snapshot->seedHash.data() ? snapshot->seedHash.data() : "");
         RandomXVerifier::instance()->prepareSeed(snapshot->nextSeedHash.data() ? snapshot->nextSeedHash.data() : "");
 
@@ -340,12 +385,16 @@ bool DaemonClient::installTemplate(const std::shared_ptr<const DaemonTemplateSou
         return fail("Unable to allocate a collision-free private job id.");
     }
 
-    job.setTemplateMetadata(snapshot->sourceId, snapshot->generation, snapshot->fetchedSteadyMs, entropyHex);
+    job.setTemplateMetadata(snapshot->sourceId, snapshot->generation, snapshot->fetchedSteadyMs,
+                            entropyHex, snapshot->prevHash);
 
     JobContext context;
     context.blocktemplate      = blocktemplate;
     context.entropy            = entropyHex;
+    context.hashingBlob        = hashingBlob;
     context.jobId              = jobId;
+    context.prevHash           = snapshot->prevHash;
+    context.seedHash           = snapshot->seedHash;
     context.hasMinerSignature  = mutated.hasMinerSignature();
     context.hasViewTag         = mutated.outputType() == 3;
     context.ephPublicKeyOffset = mutated.offset(BlockTemplate::EPH_PUBLIC_KEY_OFFSET);
@@ -359,6 +408,30 @@ bool DaemonClient::installTemplate(const std::shared_ptr<const DaemonTemplateSou
     context.generation         = snapshot->generation;
     context.height             = snapshot->height;
     context.sourceId           = snapshot->sourceId;
+
+    LiveEventStream::Row telemetry("template_derived");
+    telemetry.sourceId          = snapshot->sourceId;
+    telemetry.templateId        = std::to_string(snapshot->generation);
+    telemetry.height            = snapshot->height;
+    telemetry.prevHash          = snapshot->prevHash.data() ? snapshot->prevHash.data() : "";
+    telemetry.seedHash          = snapshot->seedHash.data() ? snapshot->seedHash.data() : "";
+    telemetry.previousSeedHash  = snapshot->previousSeedHash.data() ? snapshot->previousSeedHash.data() : "";
+    telemetry.nextSeedHash      = snapshot->nextSeedHash.data() ? snapshot->nextSeedHash.data() : "";
+    telemetry.algorithm         = job.algorithm().name();
+    telemetry.jobId             = jobId.data() ? jobId.data() : "";
+    telemetry.entropyHex        = entropyHex.data() ? entropyHex.data() : "";
+    telemetry.networkTargetDiff = snapshot->difficulty;
+    telemetry.hashingBlob       = hashingBlob.data() ? hashingBlob.data() : "";
+    // The shared template_cached row already carries the original full
+    // template. reserved_offset + this job's entropy reconstruct the private
+    // template without repeating a potentially large blob for every miner.
+    telemetry.nonceOffset       = job.nonceOffset();
+    telemetry.nonceSize         = job.nonceSize();
+    telemetry.reservedOffset    = snapshot->reservedOffset;
+    telemetry.reservedSize      = snapshot->reserveSize;
+    telemetry.extraNonceOffset  = extraNonceOffset;
+    telemetry.status            = "derived";
+    LiveEventStream::publish(telemetry);
 
     m_contexts.push_front(std::move(context));
     trimContexts();
@@ -440,6 +513,24 @@ int64_t DaemonClient::submit(const JobResult &result)
                    reinterpret_cast<const uint8_t *>(&result.extra_nonce), 4);
     }
 
+    // The consensus block ID is the CryptoNote fast hash (Keccak-256) of
+    // the canonical block hashing blob. Keep it with the exact submitted
+    // full block so a lost submitblock response can be reconciled without
+    // trusting a later daemon template.
+    BlockTemplate submitted;
+    if (!submitted.parse(blocktemplate, m_coin)) {
+        return -1;
+    }
+
+    const Buffer blockHashingBlob = submitted.generateHashingBlob();
+    uint8_t blockHash[BlockTemplate::kHashSize];
+    keccak(blockHashingBlob.data(), static_cast<int>(blockHashingBlob.size()),
+           blockHash, sizeof(blockHash));
+    const String expectedBlockId = Cvt::toHex(blockHash, sizeof(blockHash));
+    if (expectedBlockId.size() != BlockTemplate::kHashSize * 2) {
+        return -1;
+    }
+
     using namespace rapidjson;
     Document doc(kObjectType);
     Value params(kArrayType);
@@ -448,7 +539,8 @@ int64_t DaemonClient::submit(const JobResult &result)
     const int64_t requestId = m_sequence;
     JsonRequest::create(doc, requestId, "submitblock", params);
 
-    m_results[requestId] = SubmitResult(
+    PendingSubmission submission;
+    submission.result = SubmitResult(
         requestId,
         context->difficulty,
         result.actualDiff(),
@@ -459,15 +551,23 @@ int64_t DaemonClient::submit(const JobResult &result)
         context->generation,
         context->height,
         context->entropy,
-        context->sourceId
+        context->sourceId,
+        result.minerDiff
     );
+    submission.blockBlob        = blocktemplate;
+    submission.expectedBlockId  = expectedBlockId;
+    submission.attemptStartedMs = Chrono::steadyMSecs();
+    m_pendingSubmissions[requestId] = std::move(submission);
 
     LiveEventStream::Row row("submit_block");
     row.sourceId         = context->sourceId;
     row.templateId       = std::to_string(context->generation);
     row.height           = context->height;
+    row.prevHash         = context->prevHash.data() ? context->prevHash.data() : "";
+    row.seedHash         = context->seedHash.data() ? context->seedHash.data() : "";
     row.jobId            = context->jobId.data() ? context->jobId.data() : "";
     row.entropyHex       = context->entropy.data() ? context->entropy.data() : "";
+    row.minerTargetDiff  = result.minerDiff;
     row.networkTargetDiff = context->difficulty;
     row.shareDiff        = result.actualDiff();
     row.shareId          = result.shareId;
@@ -475,17 +575,39 @@ int64_t DaemonClient::submit(const JobResult &result)
     row.daemonRequestId  = requestId;
     row.nonce            = result.nonce;
     row.resultHash       = result.result ? result.result : "";
+    row.submittedBlockBlob = blocktemplate.data() ? blocktemplate.data() : "";
+    row.blockId          = expectedBlockId.data() ? expectedBlockId.data() : "";
+    row.nonceOffset      = context->nonceOffset;
+    row.nonceSize        = context->nonceSize;
+    row.extraNonceOffset = context->extraNonceOffset;
+    if (result.extra_nonce >= 0) {
+        row.extraNonce = result.extra_nonce;
+    }
+    row.signatureHex     = result.sig ? result.sig : "";
+    if (context->hasViewTag) {
+        row.viewTag = result.view_tag;
+    }
+    uint8_t minerTxHash[BlockTemplate::kHashSize];
+    BlockTemplate::calculateMinerTxHash(
+        submitted.blob(BlockTemplate::MINER_TX_PREFIX_OFFSET),
+        submitted.blob(BlockTemplate::MINER_TX_PREFIX_END_OFFSET),
+        minerTxHash);
+    const String minerTxHashHex = Cvt::toHex(minerTxHash, sizeof(minerTxHash));
+    row.minerTxHash = minerTxHashHex.data() ? minerTxHashHex.data() : "";
+    m_pendingSubmissions[requestId].minerTxHash = minerTxHashHex;
     row.status           = "requested";
     LiveEventStream::publish(row);
 
     std::map<std::string, std::string> headers;
     headers.insert({"X-Hash-Difficulty", std::to_string(result.actualDiff())});
 
-    return rpcSend(doc, headers);
+    return rpcSend(doc, headers, kHttpSubmit);
 }
 
 
-int64_t DaemonClient::rpcSend(const rapidjson::Document &doc, const std::map<std::string, std::string> &headers)
+int64_t DaemonClient::rpcSend(const rapidjson::Document &doc,
+                              const std::map<std::string, std::string> &headers,
+                              int userType)
 {
     const int64_t requestId = m_sequence++;
     FetchRequest req(HTTP_POST, m_pool.host(), m_pool.port(), kJsonRpc, doc, m_pool.isTLS(), isQuiet());
@@ -497,18 +619,20 @@ int64_t DaemonClient::rpcSend(const rapidjson::Document &doc, const std::map<std
 
     // HttpClient stores the tag pointer for the life of the asynchronous
     // request, so it must not point into this DaemonClient's mutable string.
-    fetch(kSubmitTag, std::move(req), m_httpListener, kHttpSubmit, static_cast<uint64_t>(requestId));
+    fetch(kSubmitTag, std::move(req), m_httpListener, userType, static_cast<uint64_t>(requestId));
     return requestId;
 }
 
 
 void DaemonClient::onHttpData(const HttpData &data)
 {
-    if (data.userType != kHttpSubmit) {
+    if (data.userType != kHttpSubmit && data.userType != kHttpReconcile) {
         return;
     }
 
-    m_ip = data.ip().c_str();
+    if (data.status > 0) {
+        m_ip = data.ip().c_str();
+    }
 
 #   ifdef XMRIG_FEATURE_TLS
     m_tlsVersion     = data.tlsVersion();
@@ -516,111 +640,361 @@ void DaemonClient::onHttpData(const HttpData &data)
 #   endif
 
     if (data.status != 200) {
-        const std::string error = std::string("HTTP ") + std::to_string(data.status);
-        rapidjson::Value empty(rapidjson::kNullType);
-        rapidjson::Document doc(rapidjson::kObjectType);
-        auto &allocator = doc.GetAllocator();
-        rapidjson::Value rpcError(rapidjson::kObjectType);
-        rpcError.AddMember("message", rapidjson::Value(error.c_str(), allocator), allocator);
-        parseSubmitResponse(static_cast<int64_t>(data.rpcId), empty, rpcError);
+        const std::string error = data.status < 0
+            ? std::string("transport error: ") + uv_strerror(data.status)
+            : std::string("HTTP ") + std::to_string(data.status);
+
+        if (data.userType == kHttpSubmit) {
+            onIndeterminateSubmit(static_cast<int64_t>(data.rpcId), error.c_str());
+        }
+        else {
+            const std::string message = std::string("submitblock reconciliation unavailable: ") + error;
+            finalizeSubmission(static_cast<int64_t>(data.rpcId), SubmitResult::Outcome::Ambiguous,
+                               message.c_str());
+        }
         return;
     }
 
     rapidjson::Document doc;
     if (doc.Parse(data.body.c_str()).HasParseError()) {
         const std::string error = std::string("JSON decode failed: ") + rapidjson::GetParseError_En(doc.GetParseError());
-        rapidjson::Document synthetic(rapidjson::kObjectType);
-        auto &allocator = synthetic.GetAllocator();
-        rapidjson::Value rpcError(rapidjson::kObjectType);
-        rpcError.AddMember("message", rapidjson::Value(error.c_str(), allocator), allocator);
-        rapidjson::Value empty(rapidjson::kNullType);
-        parseSubmitResponse(static_cast<int64_t>(data.rpcId), empty, rpcError);
+        if (data.userType == kHttpSubmit) {
+            onIndeterminateSubmit(static_cast<int64_t>(data.rpcId), error.c_str());
+        }
+        else {
+            const std::string message = std::string("submitblock reconciliation unavailable: ") + error;
+            finalizeSubmission(static_cast<int64_t>(data.rpcId), SubmitResult::Outcome::Ambiguous,
+                               message.c_str());
+        }
         return;
     }
 
     const int64_t responseId = Json::getInt64(doc, "id", -1);
     if (responseId != static_cast<int64_t>(data.rpcId)) {
-        rapidjson::Document synthetic(rapidjson::kObjectType);
-        auto &allocator = synthetic.GetAllocator();
-        rapidjson::Value rpcError(rapidjson::kObjectType);
-        rpcError.AddMember("message", "Mismatched submitblock response id", allocator);
-        rapidjson::Value empty(rapidjson::kNullType);
-        parseSubmitResponse(static_cast<int64_t>(data.rpcId), empty, rpcError);
+        const char *message = data.userType == kHttpSubmit
+            ? "Mismatched submitblock response id"
+            : "submitblock reconciliation returned a mismatched response id";
+        if (data.userType == kHttpSubmit) {
+            onIndeterminateSubmit(static_cast<int64_t>(data.rpcId), message);
+        }
+        else {
+            finalizeSubmission(static_cast<int64_t>(data.rpcId), SubmitResult::Outcome::Ambiguous,
+                               message);
+        }
         return;
     }
 
-    parseSubmitResponse(static_cast<int64_t>(data.rpcId),
-                        Json::getObject(doc, "result"), Json::getObject(doc, "error"));
+    if (data.userType == kHttpSubmit) {
+        parseSubmitResponse(static_cast<int64_t>(data.rpcId),
+                            Json::getObject(doc, "result"), Json::getObject(doc, "error"));
+    }
+    else {
+        parseReconcileResponse(static_cast<int64_t>(data.rpcId),
+                               Json::getObject(doc, "result"), Json::getObject(doc, "error"));
+    }
 }
 
 
 bool DaemonClient::parseSubmitResponse(int64_t id, const rapidjson::Value &result, const rapidjson::Value &error)
 {
-    auto it = m_results.find(id);
-    if (it == m_results.end()) {
+    auto it = m_pendingSubmissions.find(id);
+    if (it == m_pendingSubmissions.end()) {
         return false;
     }
 
     std::string errorMessage;
-    const char *message = nullptr;
     int64_t errorCode = 0;
 
     if (error.IsObject()) {
-        errorMessage = Json::getString(error, "message", "submitblock RPC error");
-        message = errorMessage.c_str();
+        if (!jsonString(error, "message", errorMessage)) {
+            return onIndeterminateSubmit(id, "Missing, invalid, or embedded-NUL submitblock error message");
+        }
         errorCode = Json::getInt64(error, "code", 0);
-    }
-    else if (!result.IsObject()) {
-        message = "Invalid submitblock response";
-    }
-    else {
-        const char *status = Json::getString(result, "status");
-        if (!status || strcmp(status, "OK") != 0) {
-            errorMessage = "submitblock status: ";
-            errorMessage += status ? status : "missing";
-            message = errorMessage.c_str();
+        if (it->second.attempts > 1 && !it->second.lastIndeterminateError.empty()) {
+            it->second.retryRejection     = errorMessage;
+            it->second.retryRejectionCode = errorCode;
+            return reconcileSubmission(id, errorMessage.c_str()) >= 0;
         }
-        else {
-            const char *blockId = Json::getString(result, "block_id");
-            uint8_t blockHash[32];
-            if (!blockId || strlen(blockId) != sizeof(blockHash) * 2 ||
-                !Cvt::fromHex(blockHash, sizeof(blockHash), blockId, sizeof(blockHash) * 2)) {
-                message = "Invalid submitblock block_id";
-            }
-        }
+
+        return finalizeSubmission(id, SubmitResult::Outcome::Rejected,
+                                  errorMessage.c_str(), errorCode);
     }
 
-    const SubmitResult &submission = it->second;
-    LiveEventStream::Row row("submit_block_result");
-    if (submission.templateSourceId) {
-        row.sourceId = submission.templateSourceId;
+    if (!result.IsObject()) {
+        return onIndeterminateSubmit(id, "Invalid submitblock response");
     }
-    if (submission.templateGeneration) {
-        row.templateId = std::to_string(submission.templateGeneration);
+
+    std::string status;
+    if (!jsonString(result, "status", status)) {
+        return onIndeterminateSubmit(id, "Missing or invalid submitblock status");
     }
-    if (submission.height) {
-        row.height = submission.height;
+
+    if (status != "OK") {
+        errorMessage = "submitblock status: ";
+        errorMessage += status;
+        if (it->second.attempts > 1 && !it->second.lastIndeterminateError.empty()) {
+            it->second.retryRejection = errorMessage;
+            return reconcileSubmission(id, errorMessage.c_str()) >= 0;
+        }
+
+        return finalizeSubmission(id, SubmitResult::Outcome::Rejected,
+                                  errorMessage.c_str());
     }
-    row.jobId             = submission.jobId.data() ? submission.jobId.data() : "";
-    row.entropyHex        = submission.entropy.data() ? submission.entropy.data() : "";
-    row.networkTargetDiff = submission.diff;
-    row.shareDiff         = submission.actualDiff;
-    if (submission.shareId) {
-        row.shareId = submission.shareId;
+
+    std::string blockId;
+    uint8_t blockHash[BlockTemplate::kHashSize];
+    if (!jsonString(result, "block_id", blockId) || blockId.size() != sizeof(blockHash) * 2 ||
+        !Cvt::fromHex(blockHash, sizeof(blockHash), blockId.c_str(), blockId.size())) {
+        return onIndeterminateSubmit(id, "Invalid submitblock block_id");
     }
-    row.minerRequestId  = submission.reqId;
-    row.daemonRequestId = submission.seq;
-    row.latencyMs       = Chrono::steadyMSecs() >= submission.startTime()
-        ? Chrono::steadyMSecs() - submission.startTime() : 0;
-    row.status          = message ? "rejected" : "accepted";
+
+    String normalizedBlockId(blockId.c_str(), blockId.size());
+    normalizedBlockId.toLower();
+    if (it->second.expectedBlockId != normalizedBlockId) {
+        errorMessage = "Mismatched submitblock block_id: expected=";
+        errorMessage += it->second.expectedBlockId.data() ? it->second.expectedBlockId.data() : "";
+        errorMessage += " received=";
+        errorMessage += blockId;
+        return onIndeterminateSubmit(id, errorMessage.c_str());
+    }
+
+    return finalizeSubmission(id, SubmitResult::Outcome::Accepted, nullptr, 0,
+                              it->second.expectedBlockId.data());
+}
+
+
+bool DaemonClient::onIndeterminateSubmit(int64_t id, const char *message)
+{
+    auto it = m_pendingSubmissions.find(id);
+    if (it == m_pendingSubmissions.end()) {
+        return false;
+    }
+
+    if (it->second.attempts < 2) {
+        return retrySubmission(id, message ? message : "indeterminate submitblock response") >= 0;
+    }
+
+    return reconcileSubmission(id, message ? message : "indeterminate submitblock retry response") >= 0;
+}
+
+
+int64_t DaemonClient::retrySubmission(int64_t id, const char *reason)
+{
+    auto it = m_pendingSubmissions.find(id);
+    if (it == m_pendingSubmissions.end() || it->second.attempts >= 2) {
+        return -1;
+    }
+
+    PendingSubmission submission(std::move(it->second));
+    m_pendingSubmissions.erase(it);
+    submission.lastIndeterminateError = reason ? reason : "indeterminate submitblock response";
+    publishSubmissionRow("submit_block_attempt", submission, id, "retryable_error",
+                         submission.lastIndeterminateError.c_str());
+
+    using namespace rapidjson;
+    Document doc(kObjectType);
+    Value params(kArrayType);
+    params.PushBack(submission.blockBlob.toJSON(), doc.GetAllocator());
+
+    const int64_t requestId = m_sequence;
+    JsonRequest::create(doc, requestId, "submitblock", params);
+    submission.attempts++;
+    submission.attemptStartedMs = Chrono::steadyMSecs();
+    m_pendingSubmissions[requestId] = std::move(submission);
+
+    PendingSubmission &pending = m_pendingSubmissions[requestId];
+    std::string message = "attempt 2 of 2 after: ";
+    message += pending.lastIndeterminateError;
+    publishSubmissionRow("submit_block_retry", pending, requestId, "requested",
+                         message.c_str());
+
+    std::map<std::string, std::string> headers;
+    headers.insert({"X-Hash-Difficulty", std::to_string(pending.result.actualDiff)});
+    return rpcSend(doc, headers, kHttpSubmit);
+}
+
+
+int64_t DaemonClient::reconcileSubmission(int64_t id, const char *reason)
+{
+    auto it = m_pendingSubmissions.find(id);
+    if (it == m_pendingSubmissions.end()) {
+        return -1;
+    }
+
+    PendingSubmission submission(std::move(it->second));
+    m_pendingSubmissions.erase(it);
+    if (submission.lastIndeterminateError.empty()) {
+        submission.lastIndeterminateError = reason ? reason : "indeterminate submitblock outcome";
+    }
+
+    using namespace rapidjson;
+    Document doc(kObjectType);
+    Value params(kObjectType);
+    params.AddMember("hash", submission.expectedBlockId.toJSON(doc), doc.GetAllocator());
+
+    const int64_t requestId = m_sequence;
+    JsonRequest::create(doc, requestId, "get_block_header_by_hash", params);
+    submission.attemptStartedMs = Chrono::steadyMSecs();
+    m_pendingSubmissions[requestId] = std::move(submission);
+
+    PendingSubmission &pending = m_pendingSubmissions[requestId];
+    std::string message = "checking expected block id after: ";
+    message += reason ? reason : pending.lastIndeterminateError;
+    publishSubmissionRow("submit_block_reconcile", pending, requestId, "requested",
+                         message.c_str());
+
+    return rpcSend(doc, {}, kHttpReconcile);
+}
+
+
+bool DaemonClient::parseReconcileResponse(int64_t id, const rapidjson::Value &result,
+                                          const rapidjson::Value &error)
+{
+    auto it = m_pendingSubmissions.find(id);
+    if (it == m_pendingSubmissions.end()) {
+        return false;
+    }
+
+    if (error.IsObject()) {
+        std::string rpcMessage;
+        if (!jsonString(error, "message", rpcMessage)) {
+            return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous,
+                                      "submitblock outcome ambiguous; malformed block lookup error");
+        }
+
+        std::string notFound = "Internal error: can't get block by hash. Hash = ";
+        notFound += it->second.expectedBlockId.data() ? it->second.expectedBlockId.data() : "";
+        notFound += '.';
+        const bool definitelyAbsent = rpcMessage == notFound;
+        if (definitelyAbsent && !it->second.retryRejection.empty()) {
+            std::string message = it->second.retryRejection;
+            message += "; reconciliation confirmed the expected block id is absent";
+            return finalizeSubmission(id, SubmitResult::Outcome::Rejected, message.c_str(),
+                                      it->second.retryRejectionCode, nullptr, true);
+        }
+
+        std::string message = "submitblock outcome ambiguous; block lookup failed: ";
+        message += rpcMessage;
+        return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous, message.c_str(),
+                                  Json::getInt64(error, "code", 0));
+    }
+
+    if (!result.IsObject()) {
+        return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous,
+                                  "submitblock outcome ambiguous; invalid block lookup response");
+    }
+
+    std::string status;
+    const bool validStatus = jsonString(result, "status", status);
+    const rapidjson::Value &header = Json::getObject(result, "block_header");
+    std::string hash;
+    uint8_t decodedHash[BlockTemplate::kHashSize];
+    const bool validHash = header.IsObject() && jsonString(header, "hash", hash) &&
+        hash.size() == sizeof(decodedHash) * 2 &&
+        Cvt::fromHex(decodedHash, sizeof(decodedHash), hash.c_str(), hash.size());
+    String normalizedHash(validHash ? hash.c_str() : nullptr, validHash ? hash.size() : 0);
+    normalizedHash.toLower();
+    if (validStatus && status == "OK" && validHash &&
+        it->second.expectedBlockId == normalizedHash) {
+        std::string message = "accepted after block-id reconciliation; earlier response: ";
+        message += it->second.lastIndeterminateError;
+        if (!it->second.retryRejection.empty()) {
+            message += "; retry response: ";
+            message += it->second.retryRejection;
+        }
+        return finalizeSubmission(id, SubmitResult::Outcome::Accepted, message.c_str(),
+                                  0, it->second.expectedBlockId.data(), true);
+    }
+
+    std::string message = "submitblock outcome ambiguous; block lookup did not return expected id ";
+    message += it->second.expectedBlockId.data() ? it->second.expectedBlockId.data() : "";
+    return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous, message.c_str());
+}
+
+
+void DaemonClient::publishSubmissionRow(const char *event, const PendingSubmission &submission,
+                                        int64_t requestId, const char *status, const char *message,
+                                        int64_t errorCode, const char *blockId,
+                                        bool includeBlockBlob) const
+{
+    LiveEventStream::Row row(event);
+    if (submission.result.templateSourceId) {
+        row.sourceId = submission.result.templateSourceId;
+    }
+    if (submission.result.templateGeneration) {
+        row.templateId = std::to_string(submission.result.templateGeneration);
+    }
+    if (submission.result.height) {
+        row.height = submission.result.height;
+    }
+    row.jobId             = submission.result.jobId.data() ? submission.result.jobId.data() : "";
+    row.entropyHex        = submission.result.entropy.data() ? submission.result.entropy.data() : "";
+    row.minerTargetDiff   = submission.result.minerDiff;
+    row.networkTargetDiff = submission.result.diff;
+    row.shareDiff         = submission.result.actualDiff;
+    if (submission.result.shareId) {
+        row.shareId = submission.result.shareId;
+    }
+    row.minerRequestId  = submission.result.reqId;
+    row.daemonRequestId = requestId;
+    const uint64_t now = Chrono::steadyMSecs();
+    const bool final = event && strcmp(event, "submit_block_result") == 0;
+    const uint64_t started = final ? submission.result.startTime() : submission.attemptStartedMs;
+    row.latencyMs = now >= started ? now - started : 0;
+    row.status    = status ? status : "";
     if (errorCode) {
         row.errorCode = errorCode;
     }
     row.errorMessage = message ? message : "";
+    row.blockId = blockId ? blockId
+        : (submission.expectedBlockId.data() ? submission.expectedBlockId.data() : "");
+    row.minerTxHash = submission.minerTxHash.data() ? submission.minerTxHash.data() : "";
+    if (includeBlockBlob) {
+        row.submittedBlockBlob = submission.blockBlob.data() ? submission.blockBlob.data() : "";
+    }
     LiveEventStream::publish(row);
+}
 
-    handleSubmitResponse(id, message);
-    return true;
+
+bool DaemonClient::finalizeSubmission(int64_t id, SubmitResult::Outcome outcome,
+                                      const char *message, int64_t errorCode,
+                                      const char *blockId, bool reconciled)
+{
+    auto it = m_pendingSubmissions.find(id);
+    if (it == m_pendingSubmissions.end()) {
+        return false;
+    }
+
+    PendingSubmission submission(std::move(it->second));
+    m_pendingSubmissions.erase(it);
+    submission.result.outcome = outcome;
+
+    std::string telemetryMessage;
+    if (message) {
+        telemetryMessage = message;
+    }
+    if (reconciled && outcome == SubmitResult::Outcome::Rejected && telemetryMessage.empty()) {
+        telemetryMessage = "reconciled as rejected";
+    }
+
+    const char *status = "ambiguous";
+    if (outcome == SubmitResult::Outcome::Accepted) {
+        status = "accepted";
+    }
+    else if (outcome == SubmitResult::Outcome::Rejected) {
+        status = "rejected";
+    }
+
+    publishSubmissionRow("submit_block_result", submission, id, status,
+                         telemetryMessage.empty() ? nullptr : telemetryMessage.c_str(),
+                         errorCode, blockId, true);
+
+    m_results[id] = std::move(submission.result);
+    const char *minerError = outcome == SubmitResult::Outcome::Accepted
+        ? nullptr
+        : (message ? message : "submitblock outcome ambiguous");
+
+    return handleSubmitResponse(id, minerError);
 }
 
 

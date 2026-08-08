@@ -123,11 +123,33 @@ private:
         JsonChain chain;
         ConfigTransform transform;
         std::unique_ptr<Config> config;
+        bool explicitConfig = false;
+        const auto &arguments = process->arguments().data();
+        for (auto it = arguments.size() > 1 ? arguments.begin() + 1 : arguments.end();
+             it != arguments.end(); ++it) {
+            const String &argument = *it;
+            if (argument == "--config" || argument == "-c" ||
+                (argument.size() > 2 && argument.data()[0] == '-' && argument.data()[1] == 'c')) {
+                explicitConfig = true;
+                break;
+            }
+        }
 
         ConfigTransform::load(chain, process, transform);
 
+        if (explicitConfig && (chain.hasFileError() || chain.fileName().isNull())) {
+            return nullptr;
+        }
+
         if (read(chain, config)) {
             return config.release();
+        }
+
+        // An explicitly selected configuration must be authoritative. Falling
+        // through to a different file after validation failed can silently
+        // start the proxy with an unintended payout address or safety policy.
+        if (explicitConfig) {
+            return nullptr;
         }
 
         chain.addFile(Process::location(Process::DataLocation, "config.json"));
@@ -220,9 +242,11 @@ void xmrig::Base::start()
         config()->save();
     }
 
+#   ifndef XMRIG_PROXY_PROJECT
     if (config()->isWatch()) {
         d_ptr->watcher = new Watcher(config()->fileName(), this);
     }
+#   endif
 }
 
 
@@ -253,6 +277,11 @@ bool xmrig::Base::isBackground() const
 
 bool xmrig::Base::reload(const rapidjson::Value &json)
 {
+#   ifdef XMRIG_PROXY_PROJECT
+    (void) json;
+    LOG_WARN("%s configuration reload is disabled; restart the proxy to apply changes", Tags::config());
+    return false;
+#   else
     JsonReader reader(json);
     if (reader.isEmpty()) {
         return false;
@@ -276,6 +305,7 @@ bool xmrig::Base::reload(const rapidjson::Value &json)
     d_ptr->replace(config);
 
     return true;
+#   endif
 }
 
 
@@ -295,6 +325,11 @@ void xmrig::Base::addListener(IBaseListener *listener)
 
 void xmrig::Base::onFileChanged(const String &fileName)
 {
+#   ifdef XMRIG_PROXY_PROJECT
+    LOG_WARN("%s ignored configuration change for \"%s\"; runtime reload is disabled",
+             Tags::config(), fileName.data());
+    return;
+#   else
     LOG_WARN("%s " YELLOW("\"%s\" was changed, reloading configuration"), Tags::config(), fileName.data());
 
     JsonChain chain;
@@ -310,6 +345,7 @@ void xmrig::Base::onFileChanged(const String &fileName)
     }
 
     d_ptr->replace(config);
+#   endif
 }
 
 
@@ -328,6 +364,9 @@ void xmrig::Base::onRequest(IApiRequest &request)
     }
     else if (request.method() == IApiRequest::METHOD_PUT || request.method() == IApiRequest::METHOD_POST) {
         if (request.url() == kConfigPathV1 || request.url() == kConfigPathV2) {
+#           ifdef XMRIG_PROXY_PROJECT
+            return request.done(403);
+#           else
             request.accept();
 
             if (!reload(request.json())) {
@@ -335,6 +374,7 @@ void xmrig::Base::onRequest(IApiRequest &request)
             }
 
             request.done(204);
+#           endif
         }
     }
 }

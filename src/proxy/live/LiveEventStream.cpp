@@ -18,7 +18,10 @@
 
 #include "proxy/live/LiveEventStream.h"
 
+#include "base/io/log/Log.h"
 #include "base/tools/Chrono.h"
+#include "base/tools/Cvt.h"
+#include "base/tools/SecureRandom.h"
 #include "proxy/events/AcceptEvent.h"
 #include "proxy/events/CloseEvent.h"
 #include "proxy/events/ConnectionEvent.h"
@@ -58,6 +61,7 @@ struct LiveEventStream::Client
 
     LiveEventStream *owner;
     bool closing = false;
+    size_t pendingBytes = 0;
     uv_pipe_t pipe{};
 };
 
@@ -123,6 +127,23 @@ std::string sanitize(const std::string &input)
 }
 
 
+std::string boundedText(const std::string &input, size_t maxBytes)
+{
+    if (input.size() <= maxBytes) {
+        return input;
+    }
+
+    size_t end = maxBytes;
+    while (end > 0 && (static_cast<unsigned char>(input[end]) & 0xc0U) == 0x80U) {
+        --end;
+    }
+
+    std::string output(input.data(), end);
+    output += "...[truncated]";
+    return output;
+}
+
+
 void appendCsvField(std::string &output, const std::string &input)
 {
     if (!output.empty()) {
@@ -146,6 +167,12 @@ void appendCsvField(std::string &output, const std::string &input)
         output.push_back(c);
     }
     output.push_back('"');
+}
+
+
+void appendCsvField(std::string &output, const std::string &input, size_t maxBytes)
+{
+    appendCsvField(output, boundedText(input, maxBytes));
 }
 
 
@@ -205,6 +232,13 @@ bool xmrig::LiveEventStream::start()
     if (m_path.empty() || (m_instance && m_instance != this) || !prepareSocketPath()) {
         return false;
     }
+
+    Buffer streamId;
+    if (!SecureRandom::bytes(16, streamId)) {
+        return false;
+    }
+    const String streamIdHex = Cvt::toHex(streamId);
+    m_streamId.assign(streamIdHex.data(), streamIdHex.size());
 
     m_server = new uv_pipe_t;
     if (uv_pipe_init(m_loop, m_server, 0) < 0) {
@@ -310,6 +344,12 @@ void xmrig::LiveEventStream::onDaemonTemplate(const std::shared_ptr<const Daemon
     row.height           = snapshot->height;
     row.prevHash         = snapshot->prevHash.data() ? snapshot->prevHash.data() : "";
     row.seedHash         = snapshot->seedHash.data() ? snapshot->seedHash.data() : "";
+    row.previousSeedHash = snapshot->previousSeedHash.data() ? snapshot->previousSeedHash.data() : "";
+    row.nextSeedHash     = snapshot->nextSeedHash.data() ? snapshot->nextSeedHash.data() : "";
+    row.hashingBlob      = snapshot->blockhashingBlob.data() ? snapshot->blockhashingBlob.data() : "";
+    row.blocktemplateBlob = snapshot->blocktemplateBlob.data() ? snapshot->blocktemplateBlob.data() : "";
+    row.reservedOffset   = snapshot->reservedOffset;
+    row.reservedSize     = snapshot->reserveSize;
     row.networkTargetDiff = snapshot->difficulty;
     row.daemonRequestId  = static_cast<int64_t>(snapshot->request.requestId);
     row.latencyMs        = snapshot->request.latencyMs;
@@ -344,6 +384,19 @@ void xmrig::LiveEventStream::onDaemonZmqNotification(const DaemonTemplateSource:
     row.sourceId        = notification.sourceId;
     row.refreshReason   = "zmq";
     row.status          = "notified";
+
+    publish(row);
+}
+
+
+void xmrig::LiveEventStream::onDaemonTipChanged(uint64_t sourceId, uint64_t height, const String &hash)
+{
+    Row row("daemon_tip_changed");
+    row.sourceId      = sourceId;
+    row.height        = height;
+    row.prevHash      = hash.data() ? hash.data() : "";
+    row.refreshReason = "zmq";
+    row.status        = "observed";
 
     publish(row);
 }
@@ -516,7 +569,7 @@ void xmrig::LiveEventStream::onRejectedEvent(IEvent *event)
         row.networkTargetDiff = e->result.diff;
         row.shareDiff       = e->result.actualDiff;
         row.latencyMs       = e->result.elapsed;
-        row.status          = "rejected_upstream";
+        row.status          = e->result.isAmbiguous() ? "ambiguous_upstream" : "rejected_upstream";
         row.errorMessage    = e->error() ? e->error() : "upstream rejected submission";
         break;
     }
@@ -542,11 +595,19 @@ void xmrig::LiveEventStream::onRejectedEvent(IEvent *event)
 
 bool xmrig::LiveEventStream::broadcast(const Row &row)
 {
-    if (row.event.empty() || m_clients.empty()) {
+    if (row.event.empty()) {
         return false;
     }
 
-    const auto data = std::make_shared<std::string>(csv(row, ++m_eventSequence));
+    // Sequence every logical event, including periods with no subscribers.
+    // The stream has no replay, so a reconnecting durable consumer can only
+    // detect missed work if events generated during its absence consume IDs.
+    const uint64_t sequence = ++m_eventSequence;
+    if (m_clients.empty()) {
+        return false;
+    }
+
+    const auto data = std::make_shared<std::string>(csv(row, sequence));
     const std::vector<Client *> clients(m_clients);
 
     for (Client *client : clients) {
@@ -632,6 +693,18 @@ bool xmrig::LiveEventStream::prepareSocketPath()
         close(descriptor);
 
         if (result == 0 || (connectError != ECONNREFUSED && connectError != ENOENT)) {
+            return false;
+        }
+
+        // The pathname may be in a directory writable by another local
+        // process. Never unlink a replacement created between the first
+        // lstat(), the stale-socket probe, and cleanup.
+        struct stat current{};
+        if (lstat(m_path.c_str(), &current) != 0) {
+            return errno == ENOENT;
+        }
+        if (!S_ISSOCK(current.st_mode) || current.st_dev != info.st_dev ||
+            current.st_ino != info.st_ino) {
             return false;
         }
 
@@ -750,23 +823,34 @@ void xmrig::LiveEventStream::write(Client *client, const std::shared_ptr<std::st
         return;
     }
 
+    if (data->size() > kMaxPendingBytesPerClient ||
+        client->pendingBytes > kMaxPendingBytesPerClient - data->size()) {
+        LOG_WARN("event stream subscriber exceeded %zu pending bytes and was disconnected",
+                 kMaxPendingBytesPerClient);
+        closeClient(client);
+        return;
+    }
+
     WriteRequest *request = new WriteRequest(client, data);
     uv_buf_t buffer = uv_buf_init(const_cast<char *>(request->data->data()),
                                   static_cast<unsigned int>(request->data->size()));
 
+    client->pendingBytes += data->size();
     if (uv_write(&request->request, reinterpret_cast<uv_stream_t *>(&client->pipe), &buffer, 1, onWrite) < 0) {
+        client->pendingBytes -= data->size();
         delete request;
         closeClient(client);
     }
 }
 
 
-std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence)
+std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence) const
 {
     std::string output;
-    output.reserve(1024);
+    output.reserve(2048 + row.hashingBlob.size() + row.blocktemplateBlob.size() +
+                   row.submittedBlockBlob.size() + row.verifierStatsJson.size());
 
-    appendCsvField(output, "2");
+    appendCsvField(output, "3");
     appendCsvField(output, std::to_string(sequence));
     appendCsvField(output, utcNow());
     appendCsvField(output, row.event);
@@ -774,8 +858,8 @@ std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence)
     appendCsvField(output, number(row.mapperId));
     appendCsvField(output, row.minerIp);
     appendCsvField(output, number(row.listenPort));
-    appendCsvField(output, row.worker);
-    appendCsvField(output, row.agent);
+    appendCsvField(output, row.worker, 256);
+    appendCsvField(output, row.agent, 512);
     appendCsvField(output, number(row.sourceId));
     appendCsvField(output, row.templateId);
     appendCsvField(output, number(row.templateAgeMs));
@@ -784,7 +868,7 @@ std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence)
     appendCsvField(output, row.prevHash);
     appendCsvField(output, row.seedHash);
     appendCsvField(output, row.algorithm);
-    appendCsvField(output, row.jobId);
+    appendCsvField(output, row.jobId, 256);
     appendCsvField(output, row.entropyHex);
     appendCsvField(output, number(row.minerTargetDiff));
     appendCsvField(output, number(row.networkTargetDiff));
@@ -796,11 +880,41 @@ std::string xmrig::LiveEventStream::csv(const Row &row, uint64_t sequence)
     appendCsvField(output, number(row.shareDiff));
     appendCsvField(output, row.status);
     appendCsvField(output, number(row.errorCode));
-    appendCsvField(output, row.errorMessage);
+    appendCsvField(output, row.errorMessage, 2048);
     appendCsvField(output, number(row.latencyMs));
     appendCsvField(output, number(row.connectionMs));
     appendCsvField(output, number(row.rxBytes));
     appendCsvField(output, number(row.txBytes));
+    appendCsvField(output, m_streamId);
+    appendCsvField(output, row.previousSeedHash);
+    appendCsvField(output, row.nextSeedHash);
+    appendCsvField(output, row.hashingBlob);
+    appendCsvField(output, row.blocktemplateBlob);
+    appendCsvField(output, row.submittedBlockBlob);
+    appendCsvField(output, row.minerTargetHex);
+    appendCsvField(output, number(row.nonceOffset));
+    appendCsvField(output, number(row.nonceSize));
+    appendCsvField(output, number(row.reservedOffset));
+    appendCsvField(output, number(row.reservedSize));
+    appendCsvField(output, number(row.extraNonceOffset));
+    appendCsvField(output, number(row.extraNonce));
+    appendCsvField(output, row.signatureHex, 256);
+    appendCsvField(output, number(row.viewTag));
+    appendCsvField(output, row.blockId);
+    appendCsvField(output, row.minerTxHash);
+    appendCsvField(output, row.verifierQueueMs);
+    appendCsvField(output, row.verifierHashMs);
+    appendCsvField(output, row.verifierTotalMs);
+    appendCsvField(output, row.verifierPrepareMs);
+    appendCsvField(output, number(row.verifierActive));
+    appendCsvField(output, number(row.verifierQueued));
+    appendCsvField(output, number(row.verifierQueueLimit));
+    appendCsvField(output, number(row.verifierSeedCount));
+    appendCsvField(output, number(row.verifierSeedCapacity));
+    appendCsvField(output, row.verifierSeedRole);
+    appendCsvField(output, row.verifierSeedStatus);
+    appendCsvField(output, number(row.verifierVmPoolSize));
+    appendCsvField(output, row.verifierStatsJson);
     output.push_back('\n');
 
     return output;
@@ -813,7 +927,12 @@ const std::string &xmrig::LiveEventStream::csvHeader()
         "schema_version,event_seq,time_utc,event,miner_id,mapper_id,miner_ip,listen_port,worker,agent,"
         "source_id,template_id,template_age_ms,refresh_reason,height,prev_hash,seed_hash,algo,job_id,entropy_hex,"
         "miner_target_diff,network_target_diff,share_id,miner_request_id,daemon_request_id,nonce,result_hash,"
-        "share_diff,status,error_code,error_message,latency_ms,connection_ms,rx_bytes,tx_bytes\n";
+        "share_diff,status,error_code,error_message,latency_ms,connection_ms,rx_bytes,tx_bytes,stream_id,"
+        "previous_seed_hash,next_seed_hash,hashing_blob,blocktemplate_blob,submitted_block_blob,miner_target_hex,"
+        "nonce_offset,nonce_size,reserved_offset,reserved_size,extra_nonce_offset,extra_nonce,signature_hex,"
+        "view_tag,block_id,miner_tx_hash,verifier_queue_ms,verifier_hash_ms,verifier_total_ms,"
+        "verifier_prepare_ms,verifier_active,verifier_queued,verifier_queue_limit,verifier_seed_count,"
+        "verifier_seed_capacity,verifier_seed_role,verifier_seed_status,verifier_vm_pool_size,verifier_stats_json\n";
 
     return header;
 }
@@ -868,6 +987,10 @@ void xmrig::LiveEventStream::onWrite(uv_write_t *request, int status)
     }
 
     Client *client = write->client;
+    if (client) {
+        const size_t size = write->data ? write->data->size() : 0;
+        client->pendingBytes = client->pendingBytes >= size ? client->pendingBytes - size : 0;
+    }
     delete write;
 
     if (status < 0 && client && client->owner) {

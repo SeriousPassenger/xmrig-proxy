@@ -141,7 +141,7 @@ void xmrig::Stats::accept(const AcceptEvent *event)
 
 void xmrig::Stats::reject(const AcceptEvent *event)
 {
-    if (event->isDonate()) {
+    if (event->isDonate() || event->result.isAmbiguous()) {
         return;
     }
 

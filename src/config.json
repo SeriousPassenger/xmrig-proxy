@@ -25,7 +25,9 @@
         "max-queue": 256,
         "max-pending-per-miner": 8,
         "max-consecutive-rejections": 8,
-        "candidate-max-per-minute": 12
+        "candidate-max-per-minute": 12,
+        "candidate-global-max-per-minute": 48,
+        "candidate-emergency-max-per-minute": 4
     },
     "bind": [
         {
@@ -83,6 +85,6 @@
     "user-agent": null,
     "syslog": false,
     "verbose": false,
-    "watch": true,
+    "watch": false,
     "workers": true
 }

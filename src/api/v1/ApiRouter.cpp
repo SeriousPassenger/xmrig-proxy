@@ -103,6 +103,7 @@ void xmrig::ApiRouter::getMiner(rapidjson::Value &reply, rapidjson::Document &do
 {
     auto &allocator = doc.GetAllocator();
     auto &stats = static_cast<Controller *>(m_base)->statsData();
+    const auto &soloAddresses = m_base->config()->soloMiningAddresses();
 
     reply.AddMember("version",      APP_VERSION, allocator);
     reply.AddMember("kind",         APP_KIND, allocator);
@@ -110,6 +111,21 @@ void xmrig::ApiRouter::getMiner(rapidjson::Value &reply, rapidjson::Document &do
     reply.AddMember("mode",         rapidjson::StringRef(m_base->config()->modeName()), allocator);
     reply.AddMember("ua",           Platform::userAgent().toJSON(), allocator);
     reply.AddMember("donate_level", m_base->config()->pools().donateLevel(), allocator);
+
+    rapidjson::Value daemonSolo(rapidjson::kObjectType);
+    rapidjson::Value payouts(rapidjson::kArrayType);
+    for (const WalletAddress &address : soloAddresses) {
+        rapidjson::Value payout(rapidjson::kObjectType);
+        payout.AddMember("address", address.toJSON(doc), allocator);
+        payout.AddMember("coin", rapidjson::StringRef(address.coin().code()), allocator);
+        payout.AddMember("network", rapidjson::StringRef(address.netName()), allocator);
+        payout.AddMember("type", "primary", allocator);
+        payout.AddMember("validated", true, allocator);
+        payouts.PushBack(payout, allocator);
+    }
+    daemonSolo.AddMember("enabled", !soloAddresses.empty(), allocator);
+    daemonSolo.AddMember("payouts", payouts, allocator);
+    reply.AddMember("daemon_solo", daemonSolo, allocator);
 
     if (stats.hashes && stats.donateHashes) {
         reply.AddMember("donated", normalize((double) stats.donateHashes / stats.hashes * 100.0), allocator);

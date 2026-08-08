@@ -108,6 +108,35 @@ public:
         OptionalNumber<uint64_t> connectionMs;
         OptionalNumber<uint64_t> rxBytes;
         OptionalNumber<uint64_t> txBytes;
+        std::string previousSeedHash;
+        std::string nextSeedHash;
+        std::string hashingBlob;
+        std::string blocktemplateBlob;
+        std::string submittedBlockBlob;
+        std::string minerTargetHex;
+        OptionalNumber<uint64_t> nonceOffset;
+        OptionalNumber<uint64_t> nonceSize;
+        OptionalNumber<uint64_t> reservedOffset;
+        OptionalNumber<uint64_t> reservedSize;
+        OptionalNumber<uint64_t> extraNonceOffset;
+        OptionalNumber<int64_t> extraNonce;
+        std::string signatureHex;
+        OptionalNumber<uint64_t> viewTag;
+        std::string blockId;
+        std::string minerTxHash;
+        std::string verifierQueueMs;
+        std::string verifierHashMs;
+        std::string verifierTotalMs;
+        std::string verifierPrepareMs;
+        OptionalNumber<uint64_t> verifierActive;
+        OptionalNumber<uint64_t> verifierQueued;
+        OptionalNumber<uint64_t> verifierQueueLimit;
+        OptionalNumber<uint64_t> verifierSeedCount;
+        OptionalNumber<uint64_t> verifierSeedCapacity;
+        std::string verifierSeedRole;
+        std::string verifierSeedStatus;
+        OptionalNumber<uint64_t> verifierVmPoolSize;
+        std::string verifierStatsJson;
     };
 
 
@@ -138,6 +167,7 @@ protected:
     void onDaemonTemplateRequest(const DaemonTemplateSource::RequestMetadata &request) override;
     void onDaemonTemplateError(const DaemonTemplateSource::RequestMetadata &request, const char *error) override;
     void onDaemonZmqNotification(const DaemonTemplateSource::NotificationMetadata &notification) override;
+    void onDaemonTipChanged(uint64_t sourceId, uint64_t height, const String &hash) override;
 #   endif
 
 private:
@@ -145,7 +175,8 @@ private:
     struct WriteRequest;
 
     enum : size_t {
-        kMaxClients = 5
+        kMaxClients = 5,
+        kMaxPendingBytesPerClient = 8 * 1024 * 1024
     };
 
     bool broadcast(const Row &row);
@@ -157,7 +188,7 @@ private:
     void unlinkOwnedSocket();
     void write(Client *client, const std::shared_ptr<std::string> &data);
 
-    static std::string csv(const Row &row, uint64_t sequence);
+    std::string csv(const Row &row, uint64_t sequence) const;
     static const std::string &csvHeader();
     static void onAllocate(uv_handle_t *handle, size_t suggestedSize, uv_buf_t *buf);
     static void onClientClosed(uv_handle_t *handle);
@@ -172,6 +203,7 @@ private:
     std::vector<Client *> m_clients;
     std::map<int64_t, std::vector<Row> > m_preLoginJobs;
     uint64_t m_eventSequence = 0;
+    std::string m_streamId;
     uint64_t m_socketDevice  = 0;
     uint64_t m_socketInode   = 0;
     uv_loop_t *m_loop;

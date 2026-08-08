@@ -43,6 +43,7 @@ public:
     void dump(const char *fileName);
 
     inline const String &fileName() const { return m_fileName; }
+    inline bool hasFileError() const      { return m_fileError; }
     inline size_t size() const            { return m_chain.size(); }
 
 protected:
@@ -64,6 +65,7 @@ protected:
 private:
     std::vector<rapidjson::Document> m_chain;
     String m_fileName;
+    bool m_fileError = false;
 };
 
 

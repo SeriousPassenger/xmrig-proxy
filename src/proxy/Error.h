@@ -47,7 +47,8 @@ public:
         DuplicateShare,
         InvalidResult,
         VerificationFailed,
-        CandidateRateLimit
+        CandidateRateLimit,
+        StaleShare
     };
 
     static const char *toString(int code);

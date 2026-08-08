@@ -232,7 +232,12 @@ void xmrig::SimpleMapper::onResultAccepted(IStrategy *, IClient *client, const S
         m_miner->success(result.reqId, "OK");
     }
 
-    m_miner->recordShareOutcome(error == nullptr);
+    // An exhausted submit/reconciliation path is neither a proven bad share
+    // nor an acceptance. Respond once, but do not turn daemon uncertainty
+    // into a miner strike (or reset an existing rejection streak).
+    if (!result.isAmbiguous()) {
+        m_miner->recordShareOutcome(error == nullptr);
+    }
 }
 
 

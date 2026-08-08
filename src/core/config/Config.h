@@ -22,6 +22,7 @@
 
 #include "3rdparty/rapidjson/fwd.h"
 #include "base/kernel/config/BaseConfig.h"
+#include "base/tools/cryptonote/WalletAddress.h"
 #include "base/tools/String.h"
 #include "proxy/BindHost.h"
 #include "proxy/workers/Workers.h"
@@ -67,6 +68,7 @@ public:
     inline const String &eventStreamPath() const   { return m_eventStreamPath; }
     inline const String &randomXVerifierPath() const { return m_randomXVerifierPath; }
     inline const String &password() const          { return m_password; }
+    inline const std::vector<WalletAddress> &soloMiningAddresses() const { return m_soloMiningAddresses; }
     inline bool isEventStreamEnabled() const       { return m_eventStreamEnabled; }
     inline bool isRandomXVerifierEnabled() const   { return m_randomXVerifierEnabled; }
     inline int mode() const                        { return m_mode; }
@@ -74,6 +76,8 @@ public:
     inline static IConfig *create()                { return new Config(); }
     inline uint64_t diff() const                   { return m_diff; }
     inline uint32_t randomXVerifierCandidateLimit() const { return m_randomXVerifierCandidateLimit; }
+    inline uint32_t randomXVerifierEmergencyCandidateLimit() const { return m_randomXVerifierEmergencyCandidateLimit; }
+    inline uint32_t randomXVerifierGlobalCandidateLimit() const { return m_randomXVerifierGlobalCandidateLimit; }
     inline uint32_t randomXVerifierMaxQueue() const { return m_randomXVerifierMaxQueue; }
     inline uint32_t randomXVerifierMaxPendingPerMiner() const { return m_randomXVerifierMaxPendingPerMiner; }
     inline uint32_t randomXVerifierMaxConsecutiveRejections() const { return m_randomXVerifierMaxConsecutiveRejections; }
@@ -97,12 +101,15 @@ private:
     String m_eventStreamPath    = "/run/xmrig-proxy/events.sock";
     String m_randomXVerifierPath = "/run/xmrig-randomx-verifier/verifier.sock";
     String m_password;
+    std::vector<WalletAddress> m_soloMiningAddresses;
     uint64_t m_diff             = 0;
     uint64_t m_randomXVerifierTimeout = 5000;
     uint32_t m_randomXVerifierMaxQueue = 256;
     uint32_t m_randomXVerifierMaxPendingPerMiner = 8;
     uint32_t m_randomXVerifierMaxConsecutiveRejections = 8;
     uint32_t m_randomXVerifierCandidateLimit = 12;
+    uint32_t m_randomXVerifierEmergencyCandidateLimit = 4;
+    uint32_t m_randomXVerifierGlobalCandidateLimit = 48;
     Workers::Mode m_workersMode = Workers::RigID;
 };
 

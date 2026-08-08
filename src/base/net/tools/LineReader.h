@@ -44,16 +44,23 @@ public:
 
     inline void setListener(ILineListener *listener) { m_listener = listener; }
 
-    void parse(char *data, size_t size);
+    /**
+     * Parse a chunk and return false if an input record exceeded the fixed
+     * network buffer. The oversized record is discarded through its newline;
+     * callers should normally close the peer immediately. A zero-byte libuv
+     * read notification is a successful no-op.
+     */
+    bool parse(char *data, size_t size);
     void reset();
 
 private:
-    void add(const char *data, size_t size);
-    void getline(char *data, size_t size);
+    bool add(const char *data, size_t size);
+    bool getline(char *data, size_t size);
 
     char *m_buf                 = nullptr;
     ILineListener *m_listener   = nullptr;
     size_t m_pos                = 0;
+    bool m_overflow             = false;
 };
 
 

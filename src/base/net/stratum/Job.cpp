@@ -250,6 +250,7 @@ void xmrig::Job::copy(const Job &other)
     m_rawSeedHash          = other.m_rawSeedHash;
     m_rawSigKey            = other.m_rawSigKey;
     m_templateEntropy      = other.m_templateEntropy;
+    m_templatePrevHash     = other.m_templatePrevHash;
     m_templateFetchedMs    = other.m_templateFetchedMs;
     m_templateGeneration   = other.m_templateGeneration;
     m_templateSourceId     = other.m_templateSourceId;
@@ -310,6 +311,7 @@ void xmrig::Job::move(Job &&other)
     m_rawSeedHash          = std::move(other.m_rawSeedHash);
     m_rawSigKey            = std::move(other.m_rawSigKey);
     m_templateEntropy      = std::move(other.m_templateEntropy);
+    m_templatePrevHash     = std::move(other.m_templatePrevHash);
     m_templateFetchedMs    = other.m_templateFetchedMs;
     m_templateGeneration   = other.m_templateGeneration;
     m_templateSourceId     = other.m_templateSourceId;
