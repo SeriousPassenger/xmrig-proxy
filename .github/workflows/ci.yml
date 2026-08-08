@@ -1,0 +1,236 @@
+name: Lightweight CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - improvised-daemon-mining
+  workflow_dispatch:
+
+# This workflow is safe for fork pull requests: it has no secrets and the
+# automatically provided token cannot write repository contents.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  LC_ALL: C.UTF-8
+  PYTHONUTF8: "1"
+  TZ: UTC
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  proxy-build:
+    name: proxy / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: full
+            with-http: "ON"
+            with-tls: "ON"
+            with-env: "ON"
+            binary: xmrig-proxy
+            live-api: true
+          - name: http-no-tls
+            with-http: "ON"
+            with-tls: "OFF"
+            with-env: "ON"
+            binary: xmrig-proxy-notls
+            live-api: true
+          - name: tls-no-http
+            with-http: "OFF"
+            with-tls: "ON"
+            with-env: "OFF"
+            binary: xmrig-proxy
+            live-api: false
+          - name: minimal
+            with-http: "OFF"
+            with-tls: "OFF"
+            with-env: "OFF"
+            binary: xmrig-proxy-notls
+            live-api: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            cmake \
+            libssl-dev \
+            libuv1-dev \
+            ninja-build \
+            pkg-config
+          pkg-config --atleast-version=1.33.0 libuv
+          pkg-config --modversion libuv
+
+      - name: Configure ${{ matrix.name }}
+        run: |
+          cmake \
+            -S . \
+            -B "build/${{ matrix.name }}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DBUILD_STATIC=OFF \
+            -DWITH_DEBUG_LOG=OFF \
+            -DWITH_ENV_VARS=${{ matrix.with-env }} \
+            -DWITH_GOOGLE_BREAKPAD=OFF \
+            -DWITH_HTTP=${{ matrix.with-http }} \
+            -DWITH_TLS=${{ matrix.with-tls }}
+
+      - name: Build ${{ matrix.name }}
+        run: |
+          cmake --build "build/${{ matrix.name }}" --parallel 4
+
+      - name: Run proxy build and startup checks
+        run: |
+          args=(
+            --binary "build/${{ matrix.name }}/${{ matrix.binary }}"
+            --with-http "${{ matrix.with-http }}"
+            --with-tls "${{ matrix.with-tls }}"
+          )
+          if [[ "${{ matrix.live-api }}" == true ]]; then
+            args+=(--live-api)
+          fi
+          python3 tests/ci/proxy_build_smoke.py "${args[@]}"
+
+  dashboard:
+    name: dashboard / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.14"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile dashboard sources
+        run: |
+          python -m py_compile \
+            extras/event-dashboard/xmrig_events_web.py \
+            extras/event-dashboard/test_xmrig_events_web.py
+
+      - name: Run dashboard tests
+        run: |
+          python -m unittest -v \
+            extras/event-dashboard/test_xmrig_events_web.py
+
+  quality:
+    name: repository / contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Validate JSON and Python helpers
+        run: |
+          python -m json.tool src/config.json >/dev/null
+          python -m py_compile tests/ci/proxy_build_smoke.py
+
+      - name: Run browser-backed dashboard contracts
+        run: |
+          python extras/event-dashboard/test_xmrig_events_web.py -v \
+            PageTest.test_browser_time_formatter_includes_date_time_and_milliseconds \
+            PageTest.test_hashrate_formatter_auto_scales_and_rejects_unknown_values \
+            PageTest.test_json_inspector_colors_strings_and_escapes_markup
+
+      - name: Extract embedded dashboard JavaScript
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          import re
+          from pathlib import Path
+
+          module = Path("extras/event-dashboard/xmrig_events_web.py")
+          tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+          html_values = [
+              ast.literal_eval(node.value)
+              for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(
+                  isinstance(target, ast.Name) and target.id == "HTML"
+                  for target in node.targets
+              )
+          ]
+          if len(html_values) != 1 or not isinstance(html_values[0], str):
+              raise SystemExit("expected exactly one literal HTML assignment")
+
+          scripts = re.findall(
+              r"<script>(.*?)</script>",
+              html_values[0],
+              flags=re.IGNORECASE | re.DOTALL,
+          )
+          if len(scripts) != 1:
+              raise SystemExit(f"expected exactly one embedded script, found {len(scripts)}")
+
+          output = Path(os.environ["RUNNER_TEMP"], "xmrig-event-dashboard.js")
+          output.write_text(scripts[0], encoding="utf-8")
+          PY
+
+      - name: Check embedded dashboard JavaScript
+        run: |
+          node --check "$RUNNER_TEMP/xmrig-event-dashboard.js"
+
+  required:
+    name: lightweight CI / required
+    if: ${{ always() }}
+    needs:
+      - proxy-build
+      - dashboard
+      - quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every lightweight check
+        env:
+          DASHBOARD: ${{ needs.dashboard.result }}
+          PROXY_BUILD: ${{ needs.proxy-build.result }}
+          QUALITY: ${{ needs.quality.result }}
+        run: |
+          test "$PROXY_BUILD" = success
+          test "$DASHBOARD" = success
+          test "$QUALITY" = success
