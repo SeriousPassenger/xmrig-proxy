@@ -98,6 +98,7 @@ static struct option const options[] = {
     { "ipv4",              0, nullptr, IConfig::DnsIPv4Key        },
     { "ipv6",              0, nullptr, IConfig::DnsIPv6Key        },
     { "dns-ttl",           1, nullptr, IConfig::DnsTtlKey         },
+    { "dry-run",           0, nullptr, IConfig::DryRunKey         },
     { "spend-secret-key",  1, nullptr, IConfig::SpendSecretKey    },
     { nullptr,             0, nullptr, 0 }
 };
