@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -39,6 +40,7 @@ static constexpr uint64_t kReconnectDelayMs = 1000;
 static constexpr uint64_t kSeedRetentionMs = 120000;
 static constexpr uint64_t kCandidateWindowMs = 60000;
 static constexpr uint64_t kSeedRetryDelayMs = 1000;
+static constexpr uint64_t kStatsIntervalMs = 5000;
 
 
 bool validHash(const std::string &hash)
@@ -93,17 +95,15 @@ bool zeroHash(const std::string &hash)
 }
 
 
-void publishSeedEvent(const char *event, const std::string &seedHash, const char *status,
-                      const char *error = nullptr, uint64_t latencyMs = 0)
+std::string metric(double value)
 {
-    LiveEventStream::Row row(event);
-    row.seedHash = seedHash;
-    row.status = status ? status : "";
-    row.errorMessage = error ? error : "";
-    if (latencyMs > 0) {
-        row.latencyMs = latencyMs;
+    if (!std::isfinite(value) || value < 0.0) {
+        return {};
     }
-    LiveEventStream::publish(row);
+
+    char text[32]{};
+    std::snprintf(text, sizeof(text), "%.3f", value);
+    return text;
 }
 
 
@@ -130,10 +130,13 @@ RandomXVerifier *RandomXVerifier::m_instance = nullptr;
 
 RandomXVerifier::RandomXVerifier(const std::string &path, uint64_t timeoutMs, uint32_t maxQueue,
                                  uint32_t maxPendingPerMiner, uint32_t candidateLimit,
+                                 uint32_t globalCandidateLimit, uint32_t emergencyCandidateLimit,
                                  uint32_t maxConsecutiveRejections, uv_loop_t *loop) :
     m_path(path),
     m_timeoutMs(timeoutMs),
     m_candidateLimit(candidateLimit),
+    m_emergencyCandidateLimit(emergencyCandidateLimit),
+    m_globalCandidateLimit(globalCandidateLimit),
     m_maxConsecutiveRejections(maxConsecutiveRejections),
     m_maxPendingPerMiner(maxPendingPerMiner),
     m_maxQueue(maxQueue),
@@ -199,8 +202,10 @@ void RandomXVerifier::stop()
     failAll("verifier stopped");
     m_controls.clear();
     m_candidateWindows.clear();
+    m_globalCandidateWindow.clear();
     m_ready = false;
     m_connected = false;
+    publishStatus("stopped");
 
     uv_pipe_t *pipe = m_pipe;
     m_pipe = nullptr;
@@ -283,6 +288,9 @@ void RandomXVerifier::tick()
 
     if (m_connected && m_ready) {
         requestWantedSeeds();
+        if (now >= m_nextStatsAtMs) {
+            requestStats();
+        }
     }
 
     if (!m_stopping && !m_pipe && now >= m_reconnectAtMs) {
@@ -314,6 +322,39 @@ void RandomXVerifier::prepareSeed(const std::string &seedHash)
 }
 
 
+void RandomXVerifier::setSeedRoles(uint64_t sourceId, const std::string &previousSeedHash,
+                                   const std::string &currentSeedHash, const std::string &nextSeedHash)
+{
+    const std::string previous = validHash(previousSeedHash) && !zeroHash(previousSeedHash)
+        ? previousSeedHash : std::string();
+    const std::string current = validHash(currentSeedHash) && !zeroHash(currentSeedHash)
+        ? currentSeedHash : std::string();
+    const std::string next = validHash(nextSeedHash) && !zeroHash(nextSeedHash)
+        ? nextSeedHash : std::string();
+
+    if (m_seedSourceId == sourceId && m_previousSeedHash == previous &&
+        m_currentSeedHash == current && m_nextSeedHash == next) {
+        return;
+    }
+
+    m_seedSourceId = sourceId;
+    m_previousSeedHash = previous;
+    m_currentSeedHash = current;
+    m_nextSeedHash = next;
+
+    LiveEventStream::Row row("verifier_seed_roles");
+    if (sourceId) {
+        row.sourceId = sourceId;
+    }
+    row.previousSeedHash = previous;
+    row.seedHash = current;
+    row.nextSeedHash = next;
+    row.verifierSeedCount = m_seeds.size();
+    row.status = "observed";
+    LiveEventStream::publish(row);
+}
+
+
 bool RandomXVerifier::isSeedReady(const std::string &seedHash) const
 {
     auto it = m_seeds.find(seedHash);
@@ -325,8 +366,11 @@ bool RandomXVerifier::verify(const Request &request, Callback callback)
 {
     const auto ownerEntry = m_pendingByOwner.find(request.owner);
     const uint32_t ownerPending = ownerEntry == m_pendingByOwner.end() ? 0 : ownerEntry->second;
-    if (!callback || !m_connected || !m_ready || m_pending.size() >= m_maxQueue ||
-        ownerPending >= m_maxPendingPerMiner ||
+    const size_t candidateReserve = m_maxQueue > 1 ? std::min<size_t>(4, std::max<size_t>(1, m_maxQueue / 16)) : 0;
+    const size_t admissionLimit = request.priority ? m_maxQueue : m_maxQueue - candidateReserve;
+    const uint32_t ownerLimit = request.priority ? m_maxPendingPerMiner + 1 : m_maxPendingPerMiner;
+    if (!callback || !m_connected || !m_ready || m_pending.size() >= admissionLimit ||
+        ownerPending >= ownerLimit ||
         !isSeedReady(request.seedHash) || !validHash(request.seedHash) ||
         !validHash(request.claimedHash) || !validBlob(request.blob)) {
         return false;
@@ -368,7 +412,7 @@ bool RandomXVerifier::verify(const Request &request, Callback callback)
 
 bool RandomXVerifier::allowCandidate(uintptr_t owner)
 {
-    if (m_candidateLimit == 0) {
+    if (m_candidateLimit == 0 && m_globalCandidateLimit == 0) {
         return true;
     }
 
@@ -378,11 +422,49 @@ bool RandomXVerifier::allowCandidate(uintptr_t owner)
         window.pop_front();
     }
 
-    if (window.size() >= m_candidateLimit) {
+    while (!m_globalCandidateWindow.empty() &&
+           now >= m_globalCandidateWindow.front() + kCandidateWindowMs) {
+        m_globalCandidateWindow.pop_front();
+    }
+
+    if ((m_candidateLimit != 0 && window.size() >= m_candidateLimit) ||
+        (m_globalCandidateLimit != 0 && m_globalCandidateWindow.size() >= m_globalCandidateLimit)) {
         return false;
     }
 
-    window.push_back(now);
+    if (m_candidateLimit != 0) {
+        window.push_back(now);
+    }
+    if (m_globalCandidateLimit != 0) {
+        m_globalCandidateWindow.push_back(now);
+    }
+    return true;
+}
+
+
+bool RandomXVerifier::allowEmergencyCandidate(uintptr_t owner)
+{
+    if (m_emergencyCandidateLimit == 0) {
+        return true;
+    }
+
+    const uint64_t now = Chrono::steadyMSecs();
+    std::deque<uint64_t> &ownerWindow = m_emergencyCandidateWindows[owner];
+    while (!ownerWindow.empty() && now >= ownerWindow.front() + kCandidateWindowMs) {
+        ownerWindow.pop_front();
+    }
+    while (!m_emergencyCandidateWindow.empty() &&
+           now >= m_emergencyCandidateWindow.front() + kCandidateWindowMs) {
+        m_emergencyCandidateWindow.pop_front();
+    }
+
+    if (!ownerWindow.empty() ||
+        m_emergencyCandidateWindow.size() >= m_emergencyCandidateLimit) {
+        return false;
+    }
+
+    ownerWindow.push_back(now);
+    m_emergencyCandidateWindow.push_back(now);
     return true;
 }
 
@@ -390,6 +472,7 @@ bool RandomXVerifier::allowCandidate(uintptr_t owner)
 void RandomXVerifier::cancelOwner(uintptr_t owner)
 {
     m_candidateWindows.erase(owner);
+    m_emergencyCandidateWindows.erase(owner);
 
     for (auto it = m_pending.begin(); it != m_pending.end();) {
         if (it->second.request.owner == owner) {
@@ -440,6 +523,21 @@ bool RandomXVerifier::sendControl(const char *op, const std::string &seedHash)
     }
 
     return true;
+}
+
+
+void RandomXVerifier::requestStats()
+{
+    const uint64_t now = Chrono::steadyMSecs();
+    m_nextStatsAtMs = now + kStatsIntervalMs;
+
+    for (const auto &entry : m_controls) {
+        if (entry.second.op == "stats") {
+            return;
+        }
+    }
+
+    sendControl("stats");
 }
 
 
@@ -501,6 +599,66 @@ void RandomXVerifier::requestWantedSeeds()
 }
 
 
+const char *RandomXVerifier::seedRole(const std::string &seedHash) const
+{
+    if (!seedHash.empty() && seedHash == m_currentSeedHash) {
+        return "current";
+    }
+    if (!seedHash.empty() && seedHash == m_nextSeedHash) {
+        return "next";
+    }
+    if (!seedHash.empty() && seedHash == m_previousSeedHash) {
+        return "previous";
+    }
+
+    return "retained";
+}
+
+
+void RandomXVerifier::publishSeedEvent(const char *event, const std::string &seedHash,
+                                       const char *status, const char *error, uint64_t latencyMs,
+                                       const std::string &prepareMs) const
+{
+    LiveEventStream::Row row(event);
+    if (m_seedSourceId) {
+        row.sourceId = m_seedSourceId;
+    }
+    row.seedHash = seedHash;
+    row.previousSeedHash = m_previousSeedHash;
+    row.nextSeedHash = m_nextSeedHash;
+    row.status = status ? status : "";
+    row.errorMessage = error ? error : "";
+    row.verifierSeedRole = seedRole(seedHash);
+    row.verifierSeedStatus = status ? status : "";
+    row.verifierSeedCount = m_seeds.size();
+    row.verifierPrepareMs = prepareMs;
+    row.verifierVmPoolSize = m_vmPoolSize;
+    if (latencyMs > 0) {
+        row.latencyMs = latencyMs;
+    }
+    LiveEventStream::publish(row);
+}
+
+
+void RandomXVerifier::publishStatus(const char *status, const char *error) const
+{
+    LiveEventStream::Row row("verifier_status");
+    if (m_seedSourceId) {
+        row.sourceId = m_seedSourceId;
+    }
+    row.previousSeedHash = m_previousSeedHash;
+    row.seedHash = m_currentSeedHash;
+    row.nextSeedHash = m_nextSeedHash;
+    row.status = status ? status : "";
+    row.errorMessage = error ? error : "";
+    row.verifierQueued = m_pending.size();
+    row.verifierQueueLimit = m_maxQueue;
+    row.verifierSeedCount = m_seeds.size();
+    row.verifierVmPoolSize = m_vmPoolSize;
+    LiveEventStream::publish(row);
+}
+
+
 void RandomXVerifier::disconnect(const char *error, bool failPending)
 {
     if (!m_connected && !m_pipe) {
@@ -528,6 +686,7 @@ void RandomXVerifier::disconnect(const char *error, bool failPending)
     }
 
     m_reconnectAtMs = Chrono::steadyMSecs() + kReconnectDelayMs;
+    publishStatus("disconnected", error ? error : "unknown error");
     LOG_WARN("RandomX verifier disconnected: %s", error ? error : "unknown error");
 }
 
@@ -592,12 +751,16 @@ void RandomXVerifier::handleResponse(const rapidjson::Document &doc)
                 Json::getUint(doc, "vm_pool_size", 0) == 0 ||
                 !hasCapability(capabilities, "prepare_seed") ||
                 !hasCapability(capabilities, "release_seed") ||
-                !hasCapability(capabilities, "verify")) {
+                !hasCapability(capabilities, "verify") ||
+                !hasCapability(capabilities, "stats")) {
                 return disconnect("verifier hello lacks required fast-mode capabilities");
             }
+            m_vmPoolSize = Json::getUint(doc, "vm_pool_size", 0);
             m_ready = true;
             LOG_INFO("RandomX verifier ready at %s", m_path.c_str());
+            publishStatus("ready");
             requestWantedSeeds();
+            requestStats();
         }
         else if (op == "prepare_seed") {
             uint8_t requestedSeed[32];
@@ -622,13 +785,13 @@ void RandomXVerifier::handleResponse(const rapidjson::Document &doc)
             const uint64_t now = Chrono::steadyMSecs();
             const uint64_t elapsedMs = now >= sentAtMs ? now - sentAtMs : 0;
             const char *error = Json::getString(doc, "error", "");
+            const double prepareMsValue = Json::getDouble(doc, "prepare_ms", -1.0);
             publishSeedEvent(ok ? "verifier_seed_ready" : "verifier_seed_error", seedHash,
-                             ok ? "ready" : "error", error, elapsedMs);
+                             ok ? "ready" : "error", error, elapsedMs, metric(prepareMsValue));
             if (ok) {
-                const double prepareMs = Json::getDouble(doc, "prepare_ms", -1.0);
-                if (prepareMs >= 0.0) {
+                if (prepareMsValue >= 0.0) {
                     LOG_INFO("RandomX verifier seed %.16s ready in %llu ms (sidecar %.1f ms)", seedHash.c_str(),
-                             static_cast<unsigned long long>(elapsedMs), prepareMs);
+                             static_cast<unsigned long long>(elapsedMs), prepareMsValue);
                 }
                 else {
                     LOG_INFO("RandomX verifier seed %.16s ready in %llu ms", seedHash.c_str(),
@@ -643,6 +806,42 @@ void RandomXVerifier::handleResponse(const rapidjson::Document &doc)
         else if (op == "release_seed") {
             publishSeedEvent("verifier_seed_release", seedHash, ok ? "released" : "error",
                              Json::getString(doc, "error", ""));
+        }
+        else if (op == "stats") {
+            const rapidjson::Value &stats = Json::getObject(doc, "stats");
+            if (!ok || !stats.IsObject()) {
+                publishStatus("degraded", Json::getString(doc, "error", "invalid verifier stats response"));
+                return;
+            }
+
+            const rapidjson::Value &service = Json::getObject(stats, "service");
+            const rapidjson::Value &scheduler = Json::getObject(stats, "scheduler");
+            const rapidjson::Value &seeds = Json::getObject(stats, "seeds");
+            const rapidjson::Value &timing = Json::getObject(stats, "timing");
+
+            LiveEventStream::Row row("verifier_status");
+            if (m_seedSourceId) {
+                row.sourceId = m_seedSourceId;
+            }
+            row.previousSeedHash = m_previousSeedHash;
+            row.seedHash = m_currentSeedHash;
+            row.nextSeedHash = m_nextSeedHash;
+            row.status = Json::getBool(service, "healthy", false) ? "healthy" : "degraded";
+            row.verifierQueueMs = metric(Json::getDouble(timing, "average_queue_ms", -1.0));
+            row.verifierHashMs = metric(Json::getDouble(timing, "average_hash_ms", -1.0));
+            row.verifierTotalMs = metric(Json::getDouble(timing, "average_total_ms", -1.0));
+            row.verifierActive = Json::getUint64(scheduler, "active", 0);
+            row.verifierQueued = Json::getUint64(scheduler, "queued", 0);
+            row.verifierQueueLimit = Json::getUint64(scheduler, "queue_limit", 0);
+            row.verifierSeedCount = Json::getUint64(seeds, "count", 0);
+            row.verifierSeedCapacity = Json::getUint64(seeds, "max", 0);
+            row.verifierVmPoolSize = m_vmPoolSize;
+
+            rapidjson::StringBuffer buffer;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+            stats.Accept(writer);
+            row.verifierStatsJson.assign(buffer.GetString(), buffer.GetSize());
+            LiveEventStream::publish(row);
         }
         return;
     }
@@ -666,6 +865,9 @@ void RandomXVerifier::handleResponse(const rapidjson::Document &doc)
     result.ok = Json::getBool(doc, "ok", false);
     result.hash = Json::getString(doc, "hash", "");
     result.error = Json::getString(doc, "error", "");
+    result.queueMs = metric(Json::getDouble(doc, "queue_ms", -1.0));
+    result.hashMs = metric(Json::getDouble(doc, "hash_ms", -1.0));
+    result.totalMs = metric(Json::getDouble(doc, "total_ms", -1.0));
 
     if (result.ok && !validHash(result.hash)) {
         result.ok = false;

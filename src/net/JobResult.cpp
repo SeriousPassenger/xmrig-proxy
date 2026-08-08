@@ -23,6 +23,7 @@
 
 
 #include <cstdio>
+#include <limits>
 
 
 xmrig::JobResult::JobResult(int64_t id, const char *jobId, const char *nonce, const char *result, const xmrig::Algorithm &algorithm, const char* sig, const char* sig_data, const char* commitment, uint8_t view_tag, int64_t extra_nonce) :
@@ -39,10 +40,11 @@ xmrig::JobResult::JobResult(int64_t id, const char *jobId, const char *nonce, co
 {
     if (result && strlen(result) == 64) {
         uint64_t target = 0;
-        Cvt::fromHex(reinterpret_cast<uint8_t *>(&target), sizeof(target), result + 48, 16);
-
-        if (target > 0) {
-            m_actualDiff = Job::toDiff(target);
+        if (Cvt::fromHex(reinterpret_cast<uint8_t *>(&target), sizeof(target), result + 48, 16)) {
+            // A zero high word is the strongest possible share, not an invalid
+            // difficulty. Saturate the reporting value so it remains valid and
+            // is always treated as a block candidate.
+            m_actualDiff = target == 0 ? std::numeric_limits<uint64_t>::max() : Job::toDiff(target);
         }
     }
 }

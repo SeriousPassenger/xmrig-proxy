@@ -33,6 +33,7 @@
 #include "proxy/CustomDiff.h"
 #include "proxy/events/LoginEvent.h"
 #include "proxy/Miner.h"
+#include "proxy/RandomXVerifier.h"
 
 
 xmrig::CustomDiff::CustomDiff(xmrig::Controller *controller) :
@@ -80,6 +81,20 @@ void xmrig::CustomDiff::login(LoginEvent *event)
     const unsigned long diff = strtoul(str + 1, nullptr, 10);
     if (diff < 100 || diff >= INT_MAX) {
         return;
+    }
+
+    // A downstream-controlled suffix must not turn the verifier into a cheap
+    // RandomX hashing oracle.  Preserve the historical suffix behavior when
+    // verification is disabled, but treat the configured custom difficulty as
+    // a floor when every below-network share is independently hashed.
+    const auto *config = m_controller->config();
+    if (RandomXVerifier::instance()) {
+        // With no configured floor, accepting a client-selected value as low
+        // as 100 would expose the sidecar as a public hashing oracle. In that
+        // configuration keep daemon/network difficulty and ignore suffixes.
+        if (config->diff() == 0 || diff < config->diff()) {
+            return;
+        }
     }
 
     event->miner()->setCustomDiff(diff);

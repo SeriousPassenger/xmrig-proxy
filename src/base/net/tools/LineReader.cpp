@@ -33,14 +33,17 @@ xmrig::LineReader::~LineReader()
 }
 
 
-void xmrig::LineReader::parse(char *data, size_t size)
+bool xmrig::LineReader::parse(char *data, size_t size)
 {
-    assert(m_listener != nullptr && size > 0);
-    if (!m_listener || size == 0) {
-        return;
+    assert(m_listener != nullptr);
+    if (!m_listener) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
     }
 
-    getline(data, size);
+    return getline(data, size);
 }
 
 
@@ -51,14 +54,25 @@ void xmrig::LineReader::reset()
         m_buf = nullptr;
         m_pos = 0;
     }
+
+    m_overflow = false;
 }
 
 
-void xmrig::LineReader::add(const char *data, size_t size)
+bool xmrig::LineReader::add(const char *data, size_t size)
 {
-    if (size + m_pos > XMRIG_NET_BUFFER_CHUNK_SIZE) {
-        // it breaks correctness silently for long lines
-        return;
+    // Keep one byte available for the NUL terminator required by the
+    // in-situ JSON parsers used by both downstream and upstream clients.
+    constexpr size_t maxPayload = XMRIG_NET_BUFFER_CHUNK_SIZE - 1;
+    if (m_overflow || m_pos > maxPayload || size > maxPayload - m_pos) {
+        if (m_buf) {
+            NetBuffer::release(m_buf);
+            m_buf = nullptr;
+        }
+
+        m_pos = 0;
+        m_overflow = true;
+        return false;
     }
 
     if (!m_buf) {
@@ -68,14 +82,17 @@ void xmrig::LineReader::add(const char *data, size_t size)
 
     memcpy(m_buf + m_pos, data, size);
     m_pos += size;
+    m_buf[m_pos] = '\0';
+    return true;
 }
 
 
-void xmrig::LineReader::getline(char *data, size_t size)
+bool xmrig::LineReader::getline(char *data, size_t size)
 {
     char *end        = nullptr;
     char *start      = data;
     size_t remaining = size;
+    bool valid       = true;
 
     while ((end = static_cast<char*>(memchr(start, '\n', remaining))) != nullptr) {
         *end = '\0';
@@ -83,13 +100,34 @@ void xmrig::LineReader::getline(char *data, size_t size)
         end++;
 
         const auto len = static_cast<size_t>(end - start);
-        if (m_pos) {
-            add(start, len);
-            m_listener->onLine(m_buf, m_pos - 1);
-            m_pos = 0;
+        if (m_overflow) {
+            // Discard the tail of the oversized physical record. Do not let a
+            // syntactically valid suffix be interpreted as a new request.
+            m_overflow = false;
+            return false;
+        }
+        else if (m_pos) {
+            // The delimiter is not part of the JSON payload and must not make
+            // an otherwise exactly-at-limit fragmented record overflow.
+            if (add(start, len - 1)) {
+                // add() always maintains the terminator. This matters when a
+                // JSON record is split across TCP/TLS reads: ParseInsitu()
+                // receives a C string rather than an explicit length.
+                m_listener->onLine(m_buf, m_pos);
+                m_pos = 0;
+            }
+            else {
+                m_overflow = false;
+                return false;
+            }
         }
         else if (len > 1) {
-            m_listener->onLine(start, len - 1);
+            if (len - 1 >= XMRIG_NET_BUFFER_CHUNK_SIZE) {
+                return false;
+            }
+            else {
+                m_listener->onLine(start, len - 1);
+            }
         }
 
         remaining -= len;
@@ -97,8 +135,13 @@ void xmrig::LineReader::getline(char *data, size_t size)
     }
 
     if (remaining == 0) {
-        return reset();
+        reset();
+        return valid;
     }
 
-    add(start, remaining);
+    if (!add(start, remaining)) {
+        valid = false;
+    }
+
+    return valid;
 }

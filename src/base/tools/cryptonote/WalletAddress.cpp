@@ -99,7 +99,7 @@ bool xmrig::WalletAddress::decode(const char *address, size_t size)
         uint64_t order = 1;
 
         for (int j = ((i < num_full_blocks) ? block_sizes.back() : last_block_size) - 1; j >= 0; --j) {
-            const int digit = reverse_alphabet[static_cast<int>(address_data[j])];
+            const int digit = reverse_alphabet[static_cast<unsigned char>(address_data[j])];
             if (digit < 0) {
                 return false;
             }

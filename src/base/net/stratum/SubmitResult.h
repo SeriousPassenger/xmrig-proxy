@@ -30,18 +30,29 @@
 #include "base/tools/String.h"
 
 
+#include <cstdint>
+
+
 namespace xmrig {
 
 
 class SubmitResult
 {
 public:
+    enum class Outcome : uint8_t {
+        Unspecified,
+        Accepted,
+        Rejected,
+        Ambiguous
+    };
+
     SubmitResult() = default;
 
     inline SubmitResult(int64_t seq, uint64_t diff, uint64_t actualDiff, int64_t reqId, uint32_t backend,
                         uint64_t shareId = 0, const String &jobId = String(),
                         uint64_t templateGeneration = 0, uint64_t height = 0,
-                        const String &entropy = String(), uint64_t templateSourceId = 0) :
+                        const String &entropy = String(), uint64_t templateSourceId = 0,
+                        uint64_t minerDiff = 0) :
         reqId(reqId),
         seq(seq),
         backend(backend),
@@ -53,6 +64,7 @@ public:
         jobId(jobId),
         templateGeneration(templateGeneration),
         templateSourceId(templateSourceId),
+        minerDiff(minerDiff),
         m_start(Chrono::steadyMSecs())
     {}
 
@@ -71,6 +83,10 @@ public:
     String jobId;
     uint64_t templateGeneration = 0;
     uint64_t templateSourceId   = 0;
+    uint64_t minerDiff          = 0;
+    Outcome outcome             = Outcome::Unspecified;
+
+    inline bool isAmbiguous() const { return outcome == Outcome::Ambiguous; }
 
 private:
     uint64_t m_start        = 0;

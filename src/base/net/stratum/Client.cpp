@@ -688,7 +688,7 @@ void xmrig::Client::parse(char *line, size_t len)
     }
 
     rapidjson::Document doc;
-    if (doc.ParseInsitu(line).HasParseError()) {
+    if (doc.ParseInsitu<rapidjson::kParseValidateEncodingFlag>(line).HasParseError()) {
         if (!isQuiet()) {
             LOG_ERR("%s " RED("JSON decode failed: ") RED_BOLD("\"%s\""), tag(), rapidjson::GetParseError_En(doc.GetParseError()));
         }
@@ -919,7 +919,10 @@ void xmrig::Client::read(ssize_t nread, const uv_buf_t *buf)
     else
 #   endif
     {
-        m_reader.parse(buf->base, size);
+        if (!m_reader.parse(buf->base, size)) {
+            LOG_ERR("%s " RED("read error: ") RED_BOLD("\"oversized JSON line\""), tag());
+            close();
+        }
     }
 }
 

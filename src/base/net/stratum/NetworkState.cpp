@@ -328,6 +328,10 @@ uint64_t xmrig::NetworkState::connectionTime() const
 
 void xmrig::NetworkState::add(const SubmitResult &result, const char *error)
 {
+    if (result.isAmbiguous()) {
+        return;
+    }
+
     if (error) {
         m_rejected++;
         return;

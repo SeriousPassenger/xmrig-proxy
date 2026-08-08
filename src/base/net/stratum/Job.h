@@ -104,15 +104,18 @@ public:
     inline const String &rawSeedHash() const            { return m_rawSeedHash; }
     inline const String &rawSigKey() const              { return m_rawSigKey; }
     inline const String &templateEntropy() const        { return m_templateEntropy; }
+    inline const String &templatePrevHash() const       { return m_templatePrevHash; }
     inline uint64_t templateFetchedMs() const           { return m_templateFetchedMs; }
     inline uint64_t templateGeneration() const          { return m_templateGeneration; }
     inline uint64_t templateSourceId() const             { return m_templateSourceId; }
-    inline void setTemplateMetadata(uint64_t sourceId, uint64_t generation, uint64_t fetchedMs, const String &entropy)
+    inline void setTemplateMetadata(uint64_t sourceId, uint64_t generation, uint64_t fetchedMs,
+                                    const String &entropy, const String &prevHash)
     {
         m_templateSourceId   = sourceId;
         m_templateGeneration = generation;
         m_templateFetchedMs  = fetchedMs;
         m_templateEntropy    = entropy;
+        m_templatePrevHash   = prevHash;
     }
 #   endif
 
@@ -179,6 +182,7 @@ private:
     String m_rawSeedHash;
     String m_rawSigKey;
     String m_templateEntropy;
+    String m_templatePrevHash;
     uint64_t m_templateFetchedMs  = 0;
     uint64_t m_templateGeneration = 0;
     uint64_t m_templateSourceId   = 0;

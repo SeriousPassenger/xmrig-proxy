@@ -43,6 +43,7 @@ static const char *kDuplicateShare        = "Duplicate share";
 static const char *kInvalidResult         = "Invalid share result";
 static const char *kVerificationFailed    = "RandomX verification unavailable";
 static const char *kCandidateRateLimit    = "Candidate submission rate limit exceeded";
+static const char *kStaleShare            = "Stale share";
 
 } /* namespace xmrig */
 
@@ -92,6 +93,9 @@ const char *xmrig::Error::toString(int code)
 
     case CandidateRateLimit:
         return kCandidateRateLimit;
+
+    case StaleShare:
+        return kStaleShare;
 
     default:
         break;

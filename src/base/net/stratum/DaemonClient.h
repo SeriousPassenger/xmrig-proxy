@@ -16,6 +16,7 @@
 #include "base/kernel/interfaces/IHttpListener.h"
 #include "base/net/stratum/BaseClient.h"
 #include "base/net/stratum/DaemonTemplateSource.h"
+#include "base/net/stratum/SubmitResult.h"
 #include "base/tools/cryptonote/WalletAddress.h"
 
 
@@ -63,7 +64,10 @@ private:
     {
         String blocktemplate;
         String entropy;
+        String hashingBlob;
         String jobId;
+        String prevHash;
+        String seedHash;
         bool hasMinerSignature = false;
         bool hasViewTag        = false;
         size_t ephPublicKeyOffset = 0;
@@ -79,17 +83,46 @@ private:
         uint64_t sourceId         = 0;
     };
 
+    struct PendingSubmission
+    {
+        SubmitResult result;
+        String blockBlob;
+        String expectedBlockId;
+        String minerTxHash;
+        std::string lastIndeterminateError;
+        std::string retryRejection;
+        int64_t retryRejectionCode = 0;
+        uint64_t attemptStartedMs  = 0;
+        uint32_t attempts          = 1;
+    };
+
     const JobContext *findContext(const String &jobId) const;
+    bool finalizeSubmission(int64_t id, SubmitResult::Outcome outcome, const char *message,
+                            int64_t errorCode = 0, const char *blockId = nullptr,
+                            bool reconciled = false);
     bool installTemplate(const std::shared_ptr<const DaemonTemplateSource::Snapshot> &snapshot);
+    bool onIndeterminateSubmit(int64_t id, const char *message);
+    bool parseReconcileResponse(int64_t id, const rapidjson::Value &result,
+                                const rapidjson::Value &error);
     bool prepareSpendKey(Job &job, const class BlockTemplate &blocktemplate, const char **error);
     bool parseSubmitResponse(int64_t id, const rapidjson::Value &result, const rapidjson::Value &error);
-    int64_t rpcSend(const rapidjson::Document &doc, const std::map<std::string, std::string> &headers = {});
+    void publishSubmissionRow(const char *event, const PendingSubmission &submission,
+                              int64_t requestId, const char *status, const char *message = nullptr,
+                              int64_t errorCode = 0, const char *blockId = nullptr,
+                              bool includeBlockBlob = false) const;
+    int64_t reconcileSubmission(int64_t id, const char *reason);
+    int64_t retrySubmission(int64_t id, const char *reason);
+    int64_t rpcSend(const rapidjson::Document &doc,
+                    const std::map<std::string, std::string> &headers,
+                    int userType);
     void setState(SocketState state);
     void trimContexts();
 
     Coin m_coin;
+    bool m_destroying = false;
     std::deque<JobContext> m_contexts;
     std::shared_ptr<IHttpListener> m_httpListener;
+    std::map<int64_t, PendingSubmission> m_pendingSubmissions;
     std::shared_ptr<const DaemonTemplateSource::Snapshot> m_pendingSnapshot;
     DaemonTemplateSource::Ptr m_source;
     String m_tlsFingerprint;

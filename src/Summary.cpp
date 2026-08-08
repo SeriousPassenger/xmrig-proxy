@@ -75,6 +75,16 @@ static void print_verifier(xmrig::Controller *controller)
 }
 
 
+static void print_solo_mining(xmrig::Controller *controller)
+{
+    for (const WalletAddress &address : controller->config()->soloMiningAddresses()) {
+        Log::print(GREEN_BOLD(" * ") WHITE_BOLD("Solo Mining with Daemon to Address: ")
+                   CYAN_BOLD("%s") " (%s, %s)",
+                   address.data(), address.coin().name(), address.netName());
+    }
+}
+
+
 static void print_commands(xmrig::Controller *)
 {
     if (Log::isColors()) {
@@ -97,6 +107,7 @@ void Summary::print(xmrig::Controller *controller)
     controller->config()->printVersions();
     print_mode(controller);
     controller->config()->pools().print();
+    print_solo_mining(controller);
     print_bind(controller);
     print_verifier(controller);
     print_commands(controller);

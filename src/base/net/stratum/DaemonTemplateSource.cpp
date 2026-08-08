@@ -176,6 +176,25 @@ DaemonTemplateSource::Ptr DaemonTemplateSource::acquire(const Pool &pool, const 
 }
 
 
+bool DaemonTemplateSource::isCurrentTip(uint64_t sourceId, const String &prevHash)
+{
+    if (sourceId == 0 || prevHash.isEmpty()) {
+        return true;
+    }
+
+    for (const auto &entry : registry) {
+        auto source = entry.second.lock();
+        if (source && !source->isShutdown() && source->sourceId() == sourceId) {
+            return source->m_observedTipHash.isEmpty() || source->m_observedTipHash == prevHash;
+        }
+    }
+
+    // Source teardown/strategy replacement has its own generation guards.
+    // Unknown here must not turn an otherwise valid share into a false stale.
+    return true;
+}
+
+
 void DaemonTemplateSource::setObserver(Listener *value)
 {
     observer = value;
@@ -514,6 +533,10 @@ void DaemonTemplateSource::onHttpData(const HttpData &data)
 
         complete(m_templateRequest);
         const bool advancedCachedTip = !m_latest || snapshot->prevHash != m_latest->prevHash;
+        if (m_latest && snapshot->seedHash != m_latest->seedHash) {
+            m_previousSeedHash = m_latest->seedHash;
+        }
+        snapshot->previousSeedHash = m_previousSeedHash;
         snapshot->generation = ++m_generation;
         snapshot->fetchedSteadyMs = Chrono::steadyMSecs();
         m_templateRequest.generation = snapshot->generation;
@@ -521,6 +544,7 @@ void DaemonTemplateSource::onHttpData(const HttpData &data)
 
         m_templateInFlight = false;
         m_lastSuccessSteadyMs = Chrono::steadyMSecs();
+        m_observedTipHash = snapshot->prevHash;
         m_latest = snapshot;
 
         // Schedule the next periodic refresh relative to this successful
@@ -600,6 +624,10 @@ void DaemonTemplateSource::onHttpData(const HttpData &data)
             m_zmqTimer->stop();
             m_zmqHeightRetries = 0;
             m_heightRetryFollowup = false;
+            m_observedTipHash = daemonHash;
+            if (observer) {
+                observer->onDaemonTipChanged(m_sourceId, daemonHeight, daemonHash);
+            }
 
             // Any notification received while this height request was in
             // flight may describe the same block or a genuinely later one.
@@ -947,7 +975,13 @@ bool DaemonTemplateSource::writeZmq(const char *data, size_t size)
 
 void DaemonTemplateSource::readZmq(ssize_t nread, const uv_buf_t *buf)
 {
-    if (nread <= 0) {
+    // libuv may report a zero-byte read for EAGAIN/EWOULDBLOCK. It is not an
+    // EOF or transport failure and must not tear down the ZMQ subscription.
+    if (nread == 0) {
+        return;
+    }
+
+    if (nread < 0) {
         if (nread != UV_EOF) {
             LOG_ERR("%s ZMQ read failed: \"%s\"", kTag, uv_strerror(static_cast<int>(nread)));
         }
