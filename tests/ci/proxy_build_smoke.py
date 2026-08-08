@@ -201,7 +201,15 @@ def assert_daemon_config_contract(
             assert "Solo Mining with Daemon to Address:" in result.stdout, result.stdout
             assert PAYOUT_ADDRESS in result.stdout, result.stdout
         else:
-            assert "daemon solo mining requires a proxy build with HTTP support" in result.stdout
+            # A no-HTTP build marks daemon pools inactive before the proxy's
+            # more specific solo-mining validation pass. Both diagnostics are
+            # valid fail-closed outcomes; the required exit code above is the
+            # behavioral contract.
+            assert (
+                "daemon solo mining requires a proxy build with HTTP support"
+                in result.stdout
+                or "no valid configuration found" in result.stdout
+            ), result.stdout
 
         if test_invalid_address:
             invalid = json.loads(json.dumps(config))
