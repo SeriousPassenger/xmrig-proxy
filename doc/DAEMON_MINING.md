@@ -39,30 +39,38 @@ from the newest cached template. The current job and five prior jobs are kept,
 with a 120-second maximum age for prior jobs, so an in-flight result can still
 be submitted across a refresh.
 
-Before submission, the proxy also computes and retains the candidate's
-consensus block ID from the exact finalized full block. A well-formed
-`submitblock` rejection is final and is never retried. A transport failure,
-non-200 HTTP response, malformed JSON, mismatched RPC ID, or invalid/mismatched
-returned block ID is indeterminate instead: the proxy immediately makes one
-identical bounded retry, then queries `get_block_header_by_hash` for its locally
-computed block ID if the outcome is still unclear. Finding that exact ID
-converts a lost response (including an already-exists rejection from the
-retry) into one accepted result. If the read-only lookup cannot establish
-acceptance, an explicit retry rejection plus an authoritative not-found lookup
-is reported as rejected. Every other unresolved case is explicitly
-`ambiguous`, not falsely reported as a consensus rejection. The miner receives
-exactly one final response while its route remains live; ambiguous daemon
-transport does not count as a rejected-share strike or alter accepted/rejected
-hash statistics.
+Before submission, the proxy computes and retains the finalized candidate's
+miner transaction hash. It sends `submitblock` exactly once. A well-formed
+RPC or status rejection is final. Conversely, `status: "OK"` is the daemon's
+authoritative acceptance decision and completes the normal accepted-block path
+immediately. A valid returned `block_id` is retained as the canonical ID; an
+older daemon that omits `block_id` (or returns malformed optional ID metadata)
+still produces an accepted result without an ID. The proxy never compares that
+canonical daemon ID with a locally guessed block hash and never resubmits an
+already accepted block.
+
+A transport failure, non-200 HTTP response, malformed JSON, mismatched RPC ID,
+or missing/invalid status makes the one submission indeterminate. The proxy
+then performs read-only `get_block` lookups at the known candidate height: one
+immediate attempt and up to three more, each scheduled 2,000 ms after the prior
+failed response. A lookup establishes acceptance
+only when it returns a trusted, non-orphan block at that exact height whose
+miner transaction hash and full block blob both equal the submitted candidate.
+The returned `block_header.hash` is then the canonical block ID. A different
+canonical block at that height could mean the candidate is on an alternate
+chain, so mismatches and exhausted/unavailable lookups remain `ambiguous` and
+are never converted into a rejection. The miner receives exactly one final
+response while its route remains live; ambiguous daemon transport does not
+count as a rejected-share strike or alter accepted/rejected hash statistics.
 
 This is deliberately not an unbounded delivery queue or a submission journal.
 The finalized block exists in the live telemetry row for external diagnosis,
 but pending state is process memory and is discarded on shutdown. An
-unavailable reconciliation RPC after both submit attempts therefore remains
-ambiguous and requires operator review.
+unavailable reconciliation RPC after all four read-only attempts therefore
+remains ambiguous and requires operator review.
 
 If a live daemon client disconnects or a failover replaces it while a submit is
-in flight, each accepted downstream request receives one final ambiguous
+in flight, each pending downstream request receives one final ambiguous
 response before its weak HTTP callbacks are cancelled. If the client object
 itself is already being destroyed with its listener graph, callback is unsafe;
 the event stream still emits one final ambiguous `submit_block_result` before
@@ -71,13 +79,13 @@ as an explicit coverage boundary.
 
 The bounded paths to exercise in a fault-injection test are:
 
-| First submit | Retry | Block-ID lookup | Final result |
-| --- | --- | --- | --- |
-| explicit RPC/status rejection | not sent | not sent | rejected |
-| transport/protocol ambiguity | accepted with expected ID | not sent | accepted |
-| transport/protocol ambiguity | explicit rejection | expected ID found | accepted (reconciled) |
-| transport/protocol ambiguity | explicit rejection | authoritative not found | rejected |
-| transport/protocol ambiguity | ambiguous | unavailable/not found | ambiguous |
+| Submit response | Read-only height lookup | Final result |
+| --- | --- | --- |
+| explicit RPC/status rejection | not sent | rejected |
+| status OK with valid `block_id` | not sent | accepted with canonical ID |
+| status OK without valid `block_id` | not sent | accepted without ID |
+| transport/protocol ambiguity | exact miner tx hash and blob found | accepted (reconciled) |
+| transport/protocol ambiguity | mismatch, alternate-chain uncertainty, or four failed attempts | ambiguous |
 
 For Monero, the proxy also verifies that the daemon's original
 `blockhashing_blob` matches the locally parsed template before deriving jobs.
@@ -268,22 +276,23 @@ Events include:
 - `job_sent`, `share_received`, `verify_requested`, `verify_result`,
   `verify_error`, `verify_mismatch`, `candidate_verify_fallback`, and
   `share_result`; and
-- `submit_block`, `submit_block_attempt`, `submit_block_retry`,
-  `submit_block_reconcile`, and `submit_block_result`.
+- `submit_block`, `submit_block_reconcile`, and `submit_block_result`.
 
 Empty CSV fields mean not applicable. Schema v3 intentionally carries the
 daemon's cached base template, the entropy and offsets needed to reconstruct
 each derived private template, the exact hashing blob and target sent to a
 miner, and the exact final block passed to `submitblock`. The initial
 `submit_block` and final `submit_block_result` rows carry the submitted block
-blob; interim attempt, retry, and reconciliation rows omit that redundant large
-field. Byte offsets are relative to the decoded binary blob, not its
-hexadecimal text. `submit_block.miner_tx_hash` identifies the finalized
-coinbase transaction, and an accepted response supplies `block_id`.
-`submit_block.block_id` is the locally computed expected consensus ID. Retry
-and reconciliation events carry their own active daemon request IDs, while the
+blob; reconciliation rows omit that redundant large field. Byte offsets are
+relative to the decoded binary blob, not its hexadecimal text.
+`submit_block.miner_tx_hash` identifies the finalized
+coinbase transaction. A status-OK response supplies `block_id` when the daemon
+supports it; otherwise the final result is still accepted with an empty ID.
+Reconciliation events carry their own active daemon request IDs, while the
 eventual `share_result` retains the original logical submission ID. Correlate
-across that re-keying with `share_id`, `job_id`, `source_id`, and `block_id`.
+across that re-keying with `share_id`, `job_id`, `source_id`, and
+`miner_tx_hash`.
+
 The single final `submit_block_result` is `accepted`, `rejected`, or
 `ambiguous`; a following `share_result` uses `ambiguous_upstream` for the last
 case so uncertainty is not counted as a definite rejection. Reconciled

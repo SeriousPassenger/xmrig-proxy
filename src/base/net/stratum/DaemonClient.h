@@ -87,15 +87,15 @@ private:
     {
         SubmitResult result;
         String blockBlob;
-        String expectedBlockId;
         String minerTxHash;
         std::string lastIndeterminateError;
-        std::string retryRejection;
-        int64_t retryRejectionCode = 0;
+        std::string lastReconcileError;
         uint64_t attemptStartedMs  = 0;
-        uint32_t attempts          = 1;
+        uint64_t reconcileDueMs    = 0;
+        uint32_t reconcileAttempts = 0;
     };
 
+    int64_t beginReconciliationAttempt(int64_t id);
     const JobContext *findContext(const String &jobId) const;
     bool finalizeSubmission(int64_t id, SubmitResult::Outcome outcome, const char *message,
                             int64_t errorCode = 0, const char *blockId = nullptr,
@@ -110,8 +110,8 @@ private:
                               int64_t requestId, const char *status, const char *message = nullptr,
                               int64_t errorCode = 0, const char *blockId = nullptr,
                               bool includeBlockBlob = false) const;
-    int64_t reconcileSubmission(int64_t id, const char *reason);
-    int64_t retrySubmission(int64_t id, const char *reason);
+    bool retryOrFinalizeReconciliation(int64_t id, const char *reason);
+    int64_t startReconciliation(int64_t id, const char *reason);
     int64_t rpcSend(const rapidjson::Document &doc,
                     const std::map<std::string, std::string> &headers,
                     int userType);
