@@ -122,7 +122,6 @@ public:
      * not Pool::user(), so environment-expanded identities cannot collide.
      */
     static Ptr acquire(const Pool &pool, const String &expandedWallet);
-    static bool isCurrentTip(uint64_t sourceId, const String &prevHash);
     static void setObserver(Listener *observer);
     static void shutdownAll();
 

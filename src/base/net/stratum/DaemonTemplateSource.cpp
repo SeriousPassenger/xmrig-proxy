@@ -28,6 +28,7 @@
 #include "base/tools/bswap_64.h"
 #include "base/tools/Chrono.h"
 #include "base/tools/Timer.h"
+#include "proxy/GlobalShareCache.h"
 
 
 #include <algorithm>
@@ -176,25 +177,6 @@ DaemonTemplateSource::Ptr DaemonTemplateSource::acquire(const Pool &pool, const 
 }
 
 
-bool DaemonTemplateSource::isCurrentTip(uint64_t sourceId, const String &prevHash)
-{
-    if (sourceId == 0 || prevHash.isEmpty()) {
-        return true;
-    }
-
-    for (const auto &entry : registry) {
-        auto source = entry.second.lock();
-        if (source && !source->isShutdown() && source->sourceId() == sourceId) {
-            return source->m_observedTipHash.isEmpty() || source->m_observedTipHash == prevHash;
-        }
-    }
-
-    // Source teardown/strategy replacement has its own generation guards.
-    // Unknown here must not turn an otherwise valid share into a false stale.
-    return true;
-}
-
-
 void DaemonTemplateSource::setObserver(Listener *value)
 {
     observer = value;
@@ -331,6 +313,7 @@ void DaemonTemplateSource::shutdown()
     closeZmq();
     m_listeners.clear();
     m_latest.reset();
+    GlobalShareCache::removeSource(m_sourceId);
 }
 
 
@@ -552,6 +535,9 @@ void DaemonTemplateSource::onHttpData(const HttpData &data)
         m_timer->singleShot(m_interval, kTimerPeriodic);
 
         notifySnapshot(snapshot);
+        if (!m_shutdown) {
+            GlobalShareCache::observeHeight(m_sourceId, snapshot->height);
+        }
         drainTemplateQueue();
         drainHeightQueue(advancedCachedTip);
         return;

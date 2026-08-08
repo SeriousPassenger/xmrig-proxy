@@ -406,12 +406,39 @@ should occur for the shared source. A new Monero block should produce
 `zmq_new_block`, an immediate height check (with bounded 100 ms retries while
 RPC catches up), and then a template refresh.
 
-Previous jobs from a timer refresh remain valid for 120 seconds when their
-`prev_hash` is still the current daemon tip. Once `/getheight` or a newly
-installed template observes a different parent hash, those known jobs are
-classified as `Stale share` before verifier or submit-block work. Duplicate
-`(job_id, nonce)` submissions are rejected per connection for 120 seconds;
-this state is deliberately not keyed by IP, username, or rig ID.
+Staleness is intentionally a per-miner delivery rule with one exact predicate:
+`latest_successfully_sent_height > submitted_job_height`. A ZMQ notification,
+height check, cached template, or a job that failed to write to that miner does
+not invalidate its retained work. A same-height timer refresh, transaction-set
+change, or parent replacement therefore remains eligible; ordinary shares are
+verified against their exact issued blob and a network candidate reaches the
+bounded monerod submission path. Once that miner successfully receives a job
+at a higher height, its retained lower-height jobs are classified as
+`Stale share` before verifier or submit-block work. The strict greater-than
+comparison also avoids falsely staling a retained higher-height job during a
+downward reorganization.
+
+Daemon-job duplicate detection is process-wide and connection-independent.
+The canonical key is the job's private 16-byte template entropy followed by
+the submitted 32-byte PoW result, decoded from hex so text casing cannot evade
+comparison. The key lookup is global across every live connection and daemon
+source; source and height only partition lifecycle cleanup. Verifier-backed
+acceptance still requires the independently computed result to match the
+submission. On a mismatch, the computed entropy-plus-result identity is also
+retained, preventing the same actual work from being replayed with changing
+false claims.
+
+Same-height template changes preserve the bounded in-memory set. When an
+installed source template advances height, miners that successfully received
+the replacement rebuild their eligible bucket references from their retained
+job history. A non-current bucket is retained only while at least one connected
+miner can still submit a non-stale job at that height—normally a miner that has
+not received the higher job, or the rare higher retained job after a downward
+reorganization. The existing six-job/120-second bounds still apply. The bucket
+is erased as soon as its final eligible miner advances or disconnects; expired
+references are removed on the next successful job-history rebuild (normally
+the next template poll). No duplicate state is keyed by IP, username, rig ID,
+or connection lifetime.
 
 Correlate a candidate through `share_id`, `job_id`, (`source_id`,
 `template_id`), and (`source_id`, `daemon_request_id`): `share_received` ->

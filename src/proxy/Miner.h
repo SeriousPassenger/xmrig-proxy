@@ -41,7 +41,9 @@
 #include "base/tools/Object.h"
 #include "base/tools/String.h"
 #include "proxy/Error.h"
+#include "proxy/GlobalShareCache.h"
 #include "proxy/RandomXVerifier.h"
+#include "proxy/ShareHeightPolicy.h"
 
 
 using BIO = struct bio_st;
@@ -81,8 +83,9 @@ public:
     inline void clearTelemetryJobs()
     {
         m_telemetryJobs.clear();
-        m_currentPrevHash = nullptr;
+        GlobalShareCache::removeOwner(m_key);
         m_issuedDiff = 0;
+        m_jobHeight = 0;
         ++m_verificationGeneration;
     }
     void forwardJob(const Job &job, const char *algo);
@@ -149,8 +152,24 @@ private:
         int64_t extraNonce = -1;
     };
 
+    struct SubmissionReservation
+    {
+        GlobalShareCache::Reservation global;
+        GlobalShareCache::Reservation computedGlobal;
+        std::string localKey;
+        uint64_t localToken = 0;
+    };
+
     struct PendingShare
     {
+        ~PendingShare()
+        {
+            if (!retainSubmission) {
+                GlobalShareCache::release(submission.global);
+                GlobalShareCache::release(submission.computedGlobal);
+            }
+        }
+
         Algorithm algorithm;
         int64_t mapperId = -1;
         int64_t requestId = 0;
@@ -175,6 +194,8 @@ private:
         std::string signatureData;
         std::string commitment;
         std::string entropy;
+        SubmissionReservation submission;
+        bool retainSubmission = false;
     };
 
     struct SeenSubmission
@@ -194,9 +215,13 @@ private:
     constexpr static size_t kSocketTimeout = 60 * 10 * 1000;
 
     bool isWritable() const;
-    void forgetSubmission(const char *jobId, const char *nonce);
-    bool rememberSubmission(const char *jobId, const char *nonce);
-    bool startVerification(SubmitEvent *event, const TelemetryJob &job, bool candidateFallback = false);
+    void forgetSubmission(const SubmissionReservation &reservation);
+    GlobalShareCache::Result rememberSubmission(const TelemetryJob &job, const char *jobId,
+                                                 const char *nonce, const char *resultHash,
+                                                 SubmissionReservation &reservation);
+    bool startVerification(SubmitEvent *event, const TelemetryJob &job,
+                           const SubmissionReservation &submission,
+                           bool candidateFallback = false);
     void completeVerification(const std::shared_ptr<PendingShare> &share, const RandomXVerifier::Result &result);
     void fillSubmitMetadata(SubmitEvent *event, const PendingShare &share) const;
     bool writeRaw(const char *data, size_t size);
@@ -236,7 +261,6 @@ private:
     String m_agent;
     String m_currentJobEntropy;
     String m_currentJobId;
-    String m_currentPrevHash;
     String m_password;
     String m_rigId;
     String m_user;
