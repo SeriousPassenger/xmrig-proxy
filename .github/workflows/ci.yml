@@ -98,6 +98,21 @@ jobs:
         run: |
           cmake --build "build/${{ matrix.name }}" --parallel 4
 
+      - name: Run global share-cache contracts
+        if: ${{ matrix.name == 'full' }}
+        run: |
+          g++ \
+            -std=c++11 \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -Wpedantic \
+            -Isrc \
+            tests/ci/global_share_cache_test.cpp \
+            src/proxy/GlobalShareCache.cpp \
+            -o "$RUNNER_TEMP/global-share-cache-test"
+          "$RUNNER_TEMP/global-share-cache-test"
+
       - name: Run proxy build and startup checks
         run: |
           args=(

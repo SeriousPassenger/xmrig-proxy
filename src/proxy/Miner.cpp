@@ -30,9 +30,6 @@
 #include "base/io/json/Json.h"
 #include "base/io/log/Log.h"
 #include "base/net/stratum/Job.h"
-#ifdef XMRIG_FEATURE_HTTP
-#   include "base/net/stratum/DaemonTemplateSource.h"
-#endif
 #include "base/net/tools/NetBuffer.h"
 #include "base/tools/Cvt.h"
 #include "base/tools/Chrono.h"
@@ -59,6 +56,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 
 namespace xmrig {
@@ -93,6 +91,8 @@ xmrig::Miner::Miner(const TlsContext *ctx, uint16_t port, bool strictTls) :
 
 xmrig::Miner::~Miner()
 {
+    GlobalShareCache::removeOwner(m_key);
+
     if (RandomXVerifier::instance()) {
         RandomXVerifier::instance()->cancelOwner(m_key);
     }
@@ -143,7 +143,6 @@ void xmrig::Miner::forwardJob(const Job &job, const char *algo)
     m_issuedDiff         = job.diff();
     m_currentJobId       = job.id();
     m_currentJobEntropy  = job.templateEntropy();
-    m_jobHeight          = job.height();
     m_templateGeneration = job.templateGeneration();
     m_signatureData      = job.rawSigKey();
     m_viewTag            = 0;
@@ -154,6 +153,7 @@ void xmrig::Miner::forwardJob(const Job &job, const char *algo)
         return;
     }
 
+    m_jobHeight = job.height();
     rememberJob(job, job.rawBlob(), m_issuedDiff);
 
     LiveEventStream::Row row("job_sent");
@@ -208,7 +208,6 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
     m_issuedDiff         = job.diff();
     m_currentJobId       = job.id();
     m_currentJobEntropy  = job.templateEntropy();
-    m_jobHeight          = job.height();
     m_templateGeneration = job.templateGeneration();
     m_signatureData      = nullptr;
     m_viewTag            = 0;
@@ -255,6 +254,7 @@ void xmrig::Miner::setJob(Job &job, int64_t extra_nonce)
         return;
     }
 
+    m_jobHeight = job.height();
     rememberJob(job, blob, m_issuedDiff);
 
     LiveEventStream::Row row("job_sent");
@@ -337,6 +337,7 @@ const xmrig::Miner::TelemetryJob *xmrig::Miner::findTelemetryJob(const String &i
 void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob, uint64_t issuedDiff)
 {
     static constexpr size_t kTelemetryJobCount = 6;
+    static constexpr uint64_t kTelemetryJobTtl = 120000;
 
     TelemetryJob telemetry;
     telemetry.algorithm          = job.algorithm();
@@ -358,20 +359,49 @@ void xmrig::Miner::rememberJob(const Job &job, const char *hashingBlob, uint64_t
     telemetry.extraNonce         = m_extraNonce;
 
     m_telemetryJobs.push_front(std::move(telemetry));
-    m_currentPrevHash = job.templatePrevHash();
     while (m_telemetryJobs.size() > kTelemetryJobCount) {
         m_telemetryJobs.pop_back();
+    }
+
+    if (job.templateSourceId() != 0 && m_jobHeight != 0) {
+        const uint64_t now = Chrono::steadyMSecs();
+        std::vector<uint64_t> eligibleHeights;
+        eligibleHeights.reserve(m_telemetryJobs.size());
+        for (const TelemetryJob &retained : m_telemetryJobs) {
+            if (retained.templateSourceId == job.templateSourceId() &&
+                retained.height >= m_jobHeight &&
+                now < retained.issuedAt + kTelemetryJobTtl) {
+                eligibleHeights.push_back(retained.height);
+            }
+        }
+
+        GlobalShareCache::setOwnerHeights(m_key, job.templateSourceId(), eligibleHeights);
     }
 }
 
 
-bool xmrig::Miner::rememberSubmission(const char *jobId, const char *nonce)
+xmrig::GlobalShareCache::Result xmrig::Miner::rememberSubmission(const TelemetryJob &job,
+                                                                  const char *jobId,
+                                                                  const char *nonce,
+                                                                  const char *resultHash,
+                                                                  SubmissionReservation &reservation)
 {
     static constexpr uint64_t kSubmissionTtl = 120000;
     static constexpr size_t kMaxRememberedSubmissions = 65536;
 
+    reservation = {};
     if (!jobId || !nonce) {
-        return false;
+        return GlobalShareCache::Result::Invalid;
+    }
+
+    if (job.templateSourceId != 0 && job.height != 0) {
+        std::string shareKey;
+        if (!GlobalShareCache::makeKey(job.entropy.data(), resultHash, shareKey)) {
+            return GlobalShareCache::Result::Invalid;
+        }
+
+        return GlobalShareCache::reserve(job.templateSourceId, job.height,
+                                         std::move(shareKey), reservation.global);
     }
 
     std::string key(jobId);
@@ -395,7 +425,7 @@ bool xmrig::Miner::rememberSubmission(const char *jobId, const char *nonce)
 
     auto existing = m_seenSubmissionTimes.find(key);
     if (existing != m_seenSubmissionTimes.end() && now < existing->second.seenAt + kSubmissionTtl) {
-        return false;
+        return GlobalShareCache::Result::Duplicate;
     }
 
     SeenSubmission seen;
@@ -406,23 +436,30 @@ bool xmrig::Miner::rememberSubmission(const char *jobId, const char *nonce)
     SeenSubmissionStamp &stamp = m_seenSubmissionTimes[key];
     stamp.seenAt = now;
     stamp.token = seen.token;
-    return true;
+    reservation.localKey = std::move(key);
+    reservation.localToken = seen.token;
+    return GlobalShareCache::Result::Accepted;
 }
 
 
-void xmrig::Miner::forgetSubmission(const char *jobId, const char *nonce)
+void xmrig::Miner::forgetSubmission(const SubmissionReservation &reservation)
 {
-    if (!jobId || !nonce) {
+    if (reservation.global.valid()) {
+        GlobalShareCache::release(reservation.global);
+    }
+
+    if (reservation.computedGlobal.valid()) {
+        GlobalShareCache::release(reservation.computedGlobal);
+    }
+
+    if (reservation.localKey.empty() || reservation.localToken == 0) {
         return;
     }
 
-    std::string key(jobId);
-    key.push_back(':');
-    key.append(nonce);
-    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    m_seenSubmissionTimes.erase(key);
+    const auto it = m_seenSubmissionTimes.find(reservation.localKey);
+    if (it != m_seenSubmissionTimes.end() && it->second.token == reservation.localToken) {
+        m_seenSubmissionTimes.erase(it);
+    }
 }
 
 
@@ -442,7 +479,9 @@ void xmrig::Miner::fillSubmitMetadata(SubmitEvent *event, const PendingShare &sh
 }
 
 
-bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job, bool candidateFallback)
+bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job,
+                                     const SubmissionReservation &submission,
+                                     bool candidateFallback)
 {
     RandomXVerifier *verifier = RandomXVerifier::instance();
     if (!event || !verifier || job.algorithm != Algorithm::RX_0 ||
@@ -476,6 +515,7 @@ bool xmrig::Miner::startVerification(SubmitEvent *event, const TelemetryJob &job
     share->signatureData = event->request.sig_data ? event->request.sig_data : "";
     share->commitment = event->request.commitment ? event->request.commitment : "";
     share->entropy = job.entropy.data() ? job.entropy.data() : "";
+    share->submission = submission;
     memcpy(&share->hashingBlob[job.nonceOffset * 2], share->nonce.data(), 8);
 
     RandomXVerifier::Request request;
@@ -560,6 +600,7 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
     if (share->mapperId != m_mapperId ||
         share->verificationGeneration != m_verificationGeneration ||
         !liveJob || liveJob->issuanceToken != share->issuanceToken) {
+        share->retainSubmission = true;
         return rejectPendingShare(*share, Error::InvalidJobId);
     }
 
@@ -609,7 +650,7 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
                 // No verifier or daemon accepted ownership. Preserve the
                 // connection-local strike for repeated candidate abuse, but
                 // let a genuine nonce be retried after capacity recovers.
-                forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
+                forgetSubmission(share->submission);
                 return rejectPendingShare(*share, Error::CandidateRateLimit);
             }
 
@@ -629,16 +670,18 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
             Error::Code finalError = event->error();
             event->setErrorSink(&finalError);
             if (!event->start()) {
-                forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
                 replyWithError(share->requestId, Error::toString(finalError));
                 if (finalError == Error::BadGateway || finalError == Error::VerificationFailed) {
+                    forgetSubmission(share->submission);
                     recordInfrastructureOutcome(false);
                 }
                 else {
+                    share->retainSubmission = true;
                     recordShareOutcome(false);
                 }
             }
             else {
+                share->retainSubmission = true;
                 recordInfrastructureOutcome(true);
             }
             return;
@@ -647,7 +690,7 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
         // infrastructure failure, not evidence of a bad miner: allow the
         // exact share to be retried and do not advance the connection's
         // rejection-strike counter.
-        forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
+        forgetSubmission(share->submission);
         rejectPendingShare(*share, Error::VerificationFailed, false);
         recordInfrastructureOutcome(false);
         return;
@@ -665,6 +708,40 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
                        share->commitment.empty() ? nullptr : share->commitment.c_str(), share->viewTag,
                        share->extraNonce);
     row.shareDiff = verified.actualDiff();
+
+    if (!exact && share->submission.global.valid() &&
+        GlobalShareCache::hasHeight(share->templateSourceId, share->height)) {
+        // Retain both identities after a definitive mismatch: the submitted
+        // entropy+result pair is the requested global duplicate key, while
+        // the computed pair prevents replaying the same actual work through
+        // another connection with a different forged result. Infrastructure
+        // paths release both reservations so genuine work can be retried.
+        std::string computedKey;
+        GlobalShareCache::Result computedIdentity = GlobalShareCache::Result::Invalid;
+        if (GlobalShareCache::makeKey(share->entropy.c_str(), result.hash.c_str(), computedKey)) {
+            computedIdentity = GlobalShareCache::reserve(
+                share->templateSourceId, share->height, std::move(computedKey),
+                share->submission.computedGlobal);
+        }
+
+        if (computedIdentity == GlobalShareCache::Result::Duplicate) {
+            row.status = "duplicate_result";
+            LiveEventStream::publish(row);
+            share->retainSubmission = true;
+            return rejectPendingShare(*share, Error::DuplicateShare);
+        }
+
+        if (computedIdentity != GlobalShareCache::Result::Accepted) {
+            row.event = "verify_error";
+            row.status = "duplicate_cache_unavailable";
+            row.errorMessage = "global result cache is unavailable or full";
+            LiveEventStream::publish(row);
+            forgetSubmission(share->submission);
+            rejectPendingShare(*share, Error::VerificationFailed, false);
+            recordInfrastructureOutcome(false);
+            return;
+        }
+    }
 
     // The independently computed hash is authoritative. If it solves the
     // network target, preserve the block even when the miner supplied a
@@ -690,16 +767,18 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
         Error::Code finalError = event->error();
         event->setErrorSink(&finalError);
         if (!event->start()) {
-            forgetSubmission(share->jobId.c_str(), share->nonce.c_str());
             replyWithError(share->requestId, Error::toString(finalError));
             if (finalError == Error::BadGateway || finalError == Error::VerificationFailed) {
+                forgetSubmission(share->submission);
                 recordInfrastructureOutcome(false);
             }
             else {
+                share->retainSubmission = true;
                 recordShareOutcome(false);
             }
         }
         else {
+            share->retainSubmission = true;
             recordInfrastructureOutcome(true);
         }
         return;
@@ -710,24 +789,28 @@ void xmrig::Miner::completeVerification(const std::shared_ptr<PendingShare> &sha
         row.status = "mismatch";
         row.errorMessage = std::string("claimed=") + share->claimedHash + " computed=" + result.hash;
         LiveEventStream::publish(row);
+        share->retainSubmission = true;
         return rejectPendingShare(*share, Error::InvalidResult);
     }
 
     if (verified.actualDiff() == 0 || verified.actualDiff() < share->minerDiff) {
         row.status = "low_difficulty";
         LiveEventStream::publish(row);
+        share->retainSubmission = true;
         return rejectPendingShare(*share, Error::LowDifficulty);
     }
 
     if (share->minerDiff >= share->networkDiff) {
         row.status = "low_difficulty";
         LiveEventStream::publish(row);
+        share->retainSubmission = true;
         return rejectPendingShare(*share, Error::LowDifficulty);
     }
 
     row.status = "accepted_local";
     LiveEventStream::publish(row);
     success(share->requestId, "OK");
+    share->retainSubmission = true;
 
     SubmitResult accepted(0, share->networkDiff, verified.actualDiff(), share->requestId, 0,
                           share->shareId, String(share->jobId.c_str()), share->templateGeneration,
@@ -971,14 +1054,10 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         RandomXVerifier *verifier = RandomXVerifier::instance();
         const bool claimedCandidate = telemetryJob && telemetryJob->networkDiff != 0 &&
             event->request.actualDiff() >= telemetryJob->networkDiff;
-        bool staleJob = telemetryJob && !telemetryJob->prevHash.isEmpty() &&
-            !m_currentPrevHash.isEmpty() && telemetryJob->prevHash != m_currentPrevHash;
-#       ifdef XMRIG_FEATURE_HTTP
-        if (!staleJob && telemetryJob) {
-            staleJob = !DaemonTemplateSource::isCurrentTip(telemetryJob->templateSourceId,
-                                                            telemetryJob->prevHash);
-        }
-#       endif
+        const bool staleJob = telemetryJob &&
+            ShareHeightPolicy::isStale(telemetryJob->height, m_jobHeight);
+
+        SubmissionReservation submission;
 
         if (!submittedJobId || !telemetryJob) {
             event->setError(Error::InvalidJobId);
@@ -1002,8 +1081,16 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
         else if (hasExtension(EXT_NICEHASH) && !event->request.isCompatible(m_fixedByte)) {
             event->setError(Error::InvalidNonce);
         }
-        else if (!rememberSubmission(event->request.jobId.data(), event->request.nonce)) {
-            event->setError(Error::DuplicateShare);
+        else {
+            const GlobalShareCache::Result duplicate = rememberSubmission(
+                *telemetryJob, event->request.jobId.data(), event->request.nonce,
+                event->request.result, submission);
+            if (duplicate == GlobalShareCache::Result::Duplicate) {
+                event->setError(Error::DuplicateShare);
+            }
+            else if (duplicate != GlobalShareCache::Result::Accepted) {
+                event->setError(Error::VerificationFailed);
+            }
         }
 
         const bool candidateNeedsVerification = event->error() == Error::NoError && verifier &&
@@ -1011,7 +1098,7 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
 
         if (event->error() == Error::NoError && verifier &&
             (!claimedCandidate || candidateNeedsVerification)) {
-            if (startVerification(event, *telemetryJob, candidateNeedsVerification)) {
+            if (startVerification(event, *telemetryJob, submission, candidateNeedsVerification)) {
                 // The verifier request owns all share fields. SubmitEvent uses
                 // the process-wide placement buffer and cannot survive the
                 // asynchronous Unix-socket round trip.
@@ -1051,7 +1138,7 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
                 // Admission failed before either verifier or daemon accepted
                 // ownership. Let the miner retry the same genuine nonce after
                 // the transient condition clears.
-                forgetSubmission(event->request.jobId.data(), event->request.nonce);
+                forgetSubmission(submission);
             }
         }
 
@@ -1082,7 +1169,7 @@ bool xmrig::Miner::parseRequest(int64_t id, const char *method, const rapidjson:
             if (infrastructureFailure) {
                 // SubmitEvent has been destroyed by Events::exec at this
                 // point; use the still-owned request strings instead.
-                forgetSubmission(submittedJobId, nonce);
+                forgetSubmission(submission);
             }
             replyWithError(id, Error::toString(finalError));
             if (infrastructureFailure) {

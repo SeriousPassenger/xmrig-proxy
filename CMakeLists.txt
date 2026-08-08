@@ -32,6 +32,7 @@ set(HEADERS
     src/proxy/CustomDiff.h
     src/proxy/Error.h
     src/proxy/Events.h
+    src/proxy/GlobalShareCache.h
     src/proxy/events/AcceptEvent.h
     src/proxy/events/CloseEvent.h
     src/proxy/events/ConnectionEvent.h
@@ -52,6 +53,7 @@ set(HEADERS
     src/proxy/ProxyDebug.h
     src/proxy/RandomXVerifier.h
     src/proxy/Server.h
+    src/proxy/ShareHeightPolicy.h
     src/proxy/splitters/donate/DonateMapper.h
     src/proxy/splitters/donate/DonateSplitter.h
     src/proxy/splitters/extra_nonce/ExtraNonceMapper.h
@@ -86,6 +88,7 @@ set(SOURCES
     src/proxy/CustomDiff.cpp
     src/proxy/Error.cpp
     src/proxy/Events.cpp
+    src/proxy/GlobalShareCache.cpp
     src/proxy/events/ConnectionEvent.h
     src/proxy/events/Event.cpp
     src/proxy/events/MinerEvent.cpp
