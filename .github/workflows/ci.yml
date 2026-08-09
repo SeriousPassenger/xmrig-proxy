@@ -113,6 +113,21 @@ jobs:
             -o "$RUNNER_TEMP/global-share-cache-test"
           "$RUNNER_TEMP/global-share-cache-test"
 
+      - name: Run daemon submission retry contracts
+        if: ${{ matrix.name == 'full' }}
+        run: |
+          g++ \
+            -std=c++11 \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -Wpedantic \
+            -Isrc \
+            tests/ci/daemon_reconciliation_test.cpp \
+            src/base/net/stratum/DaemonReconciliation.cpp \
+            -o "$RUNNER_TEMP/daemon-reconciliation-test"
+          "$RUNNER_TEMP/daemon-reconciliation-test"
+
       - name: Run proxy build and startup checks
         run: |
           args=(

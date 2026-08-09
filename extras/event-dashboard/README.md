@@ -130,7 +130,7 @@ coverage-complete round percentages.
 An accepted `submit_block_result` is saved immediately. The round closes only
 after the correlated `share_result:accepted_upstream` has credited the winning
 share; a fresh round then begins. Later orphan status does not reopen the round.
-The initial submit and ordered retry/reconciliation attempts are correlated by
+The initial submit and any ordered retry attempts are correlated by
 stable stream/source/share/job/template identity rather than the changing daemon
 RPC request ID. If the dashboard restarts after the accepted block result but
 before the winning share is durably credited, that round is closed as incomplete
@@ -224,7 +224,7 @@ at most five browser event streams may be connected at once. SQLite retains
 only the configured per-round top set plus threshold shares, rather than every
 ordinary share forever. The pending submission audit is capped at 256 entries
 and 64 MiB; its exact final block blob is normalized to one copy across ordered
-retry/reconciliation rows. Rejected or ambiguous block outcomes are capped by
+submit attempt and retry rows. Rejected or ambiguous block outcomes are capped by
 both count and a 64 MiB budget, while accepted block records remain durable.
 
 ## Test

@@ -14,7 +14,6 @@
 
 #include "3rdparty/rapidjson/document.h"
 #include "3rdparty/rapidjson/error/en.h"
-#include "base/crypto/keccak.h"
 #include "base/io/json/Json.h"
 #include "base/io/json/JsonRequest.h"
 #include "base/io/log/Log.h"
@@ -22,6 +21,7 @@
 #include "base/net/http/Fetch.h"
 #include "base/net/http/HttpData.h"
 #include "base/net/http/HttpListener.h"
+#include "base/net/stratum/DaemonReconciliation.h"
 #include "base/net/stratum/SubmitResult.h"
 #include "base/tools/Chrono.h"
 #include "base/tools/cryptonote/BlockTemplate.h"
@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <uv.h>
 
 
@@ -50,8 +51,7 @@ static const char *kSubmitTag = "daemon-submit";
 static constexpr size_t kEntropySize = 16;
 static constexpr size_t kJobHistorySize = 6;
 static constexpr uint64_t kJobHistoryMs = 120000;
-static const int kHttpSubmit    = 0x445403;
-static const int kHttpReconcile = 0x445404;
+static const int kHttpSubmit = 0x445403;
 
 
 bool jsonString(const rapidjson::Value &object, const char *key, std::string &out)
@@ -102,13 +102,15 @@ bool DaemonClient::disconnect()
     // telemetry is safe there.
     if (!m_destroying) {
         while (!m_pendingSubmissions.empty()) {
-            finalizeSubmission(m_pendingSubmissions.begin()->first, SubmitResult::Outcome::Ambiguous,
+            finalizeSubmission(m_pendingSubmissions.begin()->first,
+                               SubmitResult::Outcome::Ambiguous,
                                "daemon client disconnected before submitblock outcome was known");
         }
     }
     else {
         for (const auto &entry : m_pendingSubmissions) {
-            publishSubmissionRow("submit_block_result", entry.second, entry.first, "ambiguous",
+            publishSubmissionRow("submit_block_result", entry.second, entry.first,
+                                 "ambiguous",
                                  "daemon client destroyed before submitblock outcome was known",
                                  0, nullptr, true);
         }
@@ -231,21 +233,29 @@ void DaemonClient::onDaemonTemplate(const std::shared_ptr<const DaemonTemplateSo
 }
 
 
-void DaemonClient::tick(uint64_t)
+void DaemonClient::tick(uint64_t now)
 {
-    if (!m_pendingSnapshot || !RandomXVerifier::instance()) {
-        return;
+    if (m_pendingSnapshot && RandomXVerifier::instance()) {
+        const char *seedHash = m_pendingSnapshot->seedHash.data() ? m_pendingSnapshot->seedHash.data() : "";
+        if (RandomXVerifier::instance()->isSeedReady(seedHash)) {
+            const std::shared_ptr<const DaemonTemplateSource::Snapshot> snapshot = m_pendingSnapshot;
+            m_pendingSnapshot.reset();
+            if (!installTemplate(snapshot) && !isQuiet()) {
+                LOG_ERR("%s " RED("job error: ") RED_BOLD("\"Unable to derive private 16-byte template job.\""), tag());
+            }
+        }
     }
 
-    const char *seedHash = m_pendingSnapshot->seedHash.data() ? m_pendingSnapshot->seedHash.data() : "";
-    if (!RandomXVerifier::instance()->isSeedReady(seedHash)) {
-        return;
+    std::vector<int64_t> due;
+    due.reserve(m_pendingSubmissions.size());
+    for (const auto &entry : m_pendingSubmissions) {
+        if (DaemonReconciliation::isSubmitRetryDue(entry.second.retryDueMs, now)) {
+            due.push_back(entry.first);
+        }
     }
 
-    const std::shared_ptr<const DaemonTemplateSource::Snapshot> snapshot = m_pendingSnapshot;
-    m_pendingSnapshot.reset();
-    if (!installTemplate(snapshot) && !isQuiet()) {
-        LOG_ERR("%s " RED("job error: ") RED_BOLD("\"Unable to derive private 16-byte template job.\""), tag());
+    for (const int64_t id : due) {
+        retrySubmission(id);
     }
 }
 
@@ -513,21 +523,12 @@ int64_t DaemonClient::submit(const JobResult &result)
                    reinterpret_cast<const uint8_t *>(&result.extra_nonce), 4);
     }
 
-    // The consensus block ID is the CryptoNote fast hash (Keccak-256) of
-    // the canonical block hashing blob. Keep it with the exact submitted
-    // full block so a lost submitblock response can be reconciled without
-    // trusting a later daemon template.
+    // Parse the exact finalized full block once more so the locally known
+    // coinbase transaction hash is retained with every submission attempt.
+    // The daemon's first status=OK response remains authoritative for the
+    // consensus block ID and immediately stops all retries.
     BlockTemplate submitted;
     if (!submitted.parse(blocktemplate, m_coin)) {
-        return -1;
-    }
-
-    const Buffer blockHashingBlob = submitted.generateHashingBlob();
-    uint8_t blockHash[BlockTemplate::kHashSize];
-    keccak(blockHashingBlob.data(), static_cast<int>(blockHashingBlob.size()),
-           blockHash, sizeof(blockHash));
-    const String expectedBlockId = Cvt::toHex(blockHash, sizeof(blockHash));
-    if (expectedBlockId.size() != BlockTemplate::kHashSize * 2) {
         return -1;
     }
 
@@ -555,7 +556,6 @@ int64_t DaemonClient::submit(const JobResult &result)
         result.minerDiff
     );
     submission.blockBlob        = blocktemplate;
-    submission.expectedBlockId  = expectedBlockId;
     submission.attemptStartedMs = Chrono::steadyMSecs();
     m_pendingSubmissions[requestId] = std::move(submission);
 
@@ -576,7 +576,6 @@ int64_t DaemonClient::submit(const JobResult &result)
     row.nonce            = result.nonce;
     row.resultHash       = result.result ? result.result : "";
     row.submittedBlockBlob = blocktemplate.data() ? blocktemplate.data() : "";
-    row.blockId          = expectedBlockId.data() ? expectedBlockId.data() : "";
     row.nonceOffset      = context->nonceOffset;
     row.nonceSize        = context->nonceSize;
     row.extraNonceOffset = context->extraNonceOffset;
@@ -626,7 +625,7 @@ int64_t DaemonClient::rpcSend(const rapidjson::Document &doc,
 
 void DaemonClient::onHttpData(const HttpData &data)
 {
-    if (data.userType != kHttpSubmit && data.userType != kHttpReconcile) {
+    if (data.userType != kHttpSubmit) {
         return;
     }
 
@@ -644,54 +643,31 @@ void DaemonClient::onHttpData(const HttpData &data)
             ? std::string("transport error: ") + uv_strerror(data.status)
             : std::string("HTTP ") + std::to_string(data.status);
 
-        if (data.userType == kHttpSubmit) {
-            onIndeterminateSubmit(static_cast<int64_t>(data.rpcId), error.c_str());
-        }
-        else {
-            const std::string message = std::string("submitblock reconciliation unavailable: ") + error;
-            finalizeSubmission(static_cast<int64_t>(data.rpcId), SubmitResult::Outcome::Ambiguous,
-                               message.c_str());
-        }
+        retryOrFinalizeSubmission(static_cast<int64_t>(data.rpcId),
+                                  SubmitResult::Outcome::Ambiguous,
+                                  error.c_str());
         return;
     }
 
     rapidjson::Document doc;
     if (doc.Parse(data.body.c_str()).HasParseError()) {
         const std::string error = std::string("JSON decode failed: ") + rapidjson::GetParseError_En(doc.GetParseError());
-        if (data.userType == kHttpSubmit) {
-            onIndeterminateSubmit(static_cast<int64_t>(data.rpcId), error.c_str());
-        }
-        else {
-            const std::string message = std::string("submitblock reconciliation unavailable: ") + error;
-            finalizeSubmission(static_cast<int64_t>(data.rpcId), SubmitResult::Outcome::Ambiguous,
-                               message.c_str());
-        }
+        retryOrFinalizeSubmission(static_cast<int64_t>(data.rpcId),
+                                  SubmitResult::Outcome::Ambiguous,
+                                  error.c_str());
         return;
     }
 
     const int64_t responseId = Json::getInt64(doc, "id", -1);
     if (responseId != static_cast<int64_t>(data.rpcId)) {
-        const char *message = data.userType == kHttpSubmit
-            ? "Mismatched submitblock response id"
-            : "submitblock reconciliation returned a mismatched response id";
-        if (data.userType == kHttpSubmit) {
-            onIndeterminateSubmit(static_cast<int64_t>(data.rpcId), message);
-        }
-        else {
-            finalizeSubmission(static_cast<int64_t>(data.rpcId), SubmitResult::Outcome::Ambiguous,
-                               message);
-        }
+        retryOrFinalizeSubmission(static_cast<int64_t>(data.rpcId),
+                                  SubmitResult::Outcome::Ambiguous,
+                                  "Mismatched submitblock response id");
         return;
     }
 
-    if (data.userType == kHttpSubmit) {
-        parseSubmitResponse(static_cast<int64_t>(data.rpcId),
-                            Json::getObject(doc, "result"), Json::getObject(doc, "error"));
-    }
-    else {
-        parseReconcileResponse(static_cast<int64_t>(data.rpcId),
-                               Json::getObject(doc, "result"), Json::getObject(doc, "error"));
-    }
+    parseSubmitResponse(static_cast<int64_t>(data.rpcId),
+                        Json::getObject(doc, "result"), Json::getObject(doc, "error"));
 }
 
 
@@ -702,94 +678,119 @@ bool DaemonClient::parseSubmitResponse(int64_t id, const rapidjson::Value &resul
         return false;
     }
 
-    std::string errorMessage;
-    int64_t errorCode = 0;
-
+    // JSON-RPC defines result and error as mutually exclusive. If a malformed
+    // response contains both, never let an embedded status=OK override the
+    // daemon's explicit error object.
     if (error.IsObject()) {
+        std::string errorMessage;
         if (!jsonString(error, "message", errorMessage)) {
-            return onIndeterminateSubmit(id, "Missing, invalid, or embedded-NUL submitblock error message");
+            return retryOrFinalizeSubmission(
+                id, SubmitResult::Outcome::Ambiguous,
+                "Missing, invalid, or embedded-NUL submitblock error message");
         }
-        errorCode = Json::getInt64(error, "code", 0);
-        if (it->second.attempts > 1 && !it->second.lastIndeterminateError.empty()) {
-            it->second.retryRejection     = errorMessage;
-            it->second.retryRejectionCode = errorCode;
-            return reconcileSubmission(id, errorMessage.c_str()) >= 0;
-        }
-
-        return finalizeSubmission(id, SubmitResult::Outcome::Rejected,
-                                  errorMessage.c_str(), errorCode);
+        return retryOrFinalizeSubmission(id, SubmitResult::Outcome::Rejected,
+                                         errorMessage.c_str(),
+                                         Json::getInt64(error, "code", 0));
     }
 
-    if (!result.IsObject()) {
-        return onIndeterminateSubmit(id, "Invalid submitblock response");
+    const DaemonReconciliation::SubmitDecision decision =
+        DaemonReconciliation::classifySubmitResult(result);
+
+    // status=OK is the daemon's authoritative acceptance decision. A valid
+    // returned block_id is canonical even if any local diagnostic disagrees.
+    // Older daemons may omit it; that still completes immediately as accepted,
+    // with the locally calculated miner transaction hash retained as evidence.
+    if (decision.outcome == DaemonReconciliation::SubmitDecision::Outcome::Accepted) {
+        return finalizeSubmission(id, SubmitResult::Outcome::Accepted,
+                                  decision.reason.empty() ? nullptr : decision.reason.c_str(),
+                                  0,
+                                  decision.blockId.empty() ? nullptr : decision.blockId.c_str());
     }
 
-    std::string status;
-    if (!jsonString(result, "status", status)) {
-        return onIndeterminateSubmit(id, "Missing or invalid submitblock status");
+    if (decision.outcome == DaemonReconciliation::SubmitDecision::Outcome::Rejected) {
+        return retryOrFinalizeSubmission(id, SubmitResult::Outcome::Rejected,
+                                         decision.reason.c_str());
     }
 
-    if (status != "OK") {
-        errorMessage = "submitblock status: ";
-        errorMessage += status;
-        if (it->second.attempts > 1 && !it->second.lastIndeterminateError.empty()) {
-            it->second.retryRejection = errorMessage;
-            return reconcileSubmission(id, errorMessage.c_str()) >= 0;
-        }
-
-        return finalizeSubmission(id, SubmitResult::Outcome::Rejected,
-                                  errorMessage.c_str());
-    }
-
-    std::string blockId;
-    uint8_t blockHash[BlockTemplate::kHashSize];
-    if (!jsonString(result, "block_id", blockId) || blockId.size() != sizeof(blockHash) * 2 ||
-        !Cvt::fromHex(blockHash, sizeof(blockHash), blockId.c_str(), blockId.size())) {
-        return onIndeterminateSubmit(id, "Invalid submitblock block_id");
-    }
-
-    String normalizedBlockId(blockId.c_str(), blockId.size());
-    normalizedBlockId.toLower();
-    if (it->second.expectedBlockId != normalizedBlockId) {
-        errorMessage = "Mismatched submitblock block_id: expected=";
-        errorMessage += it->second.expectedBlockId.data() ? it->second.expectedBlockId.data() : "";
-        errorMessage += " received=";
-        errorMessage += blockId;
-        return onIndeterminateSubmit(id, errorMessage.c_str());
-    }
-
-    return finalizeSubmission(id, SubmitResult::Outcome::Accepted, nullptr, 0,
-                              it->second.expectedBlockId.data());
+    return retryOrFinalizeSubmission(id, SubmitResult::Outcome::Ambiguous,
+                                     decision.reason.c_str());
 }
 
 
-bool DaemonClient::onIndeterminateSubmit(int64_t id, const char *message)
+bool DaemonClient::retryOrFinalizeSubmission(int64_t id,
+                                             SubmitResult::Outcome outcome,
+                                             const char *reason,
+                                             int64_t errorCode)
 {
     auto it = m_pendingSubmissions.find(id);
-    if (it == m_pendingSubmissions.end()) {
+    if (it == m_pendingSubmissions.end() ||
+        (outcome != SubmitResult::Outcome::Rejected &&
+         outcome != SubmitResult::Outcome::Ambiguous)) {
         return false;
     }
 
-    if (it->second.attempts < 2) {
-        return retrySubmission(id, message ? message : "indeterminate submitblock response") >= 0;
+    PendingSubmission &pending = it->second;
+    pending.lastSubmitError = reason ? reason : "submitblock did not return status OK";
+    if (outcome == SubmitResult::Outcome::Ambiguous) {
+        pending.hadIndeterminateOutcome = true;
     }
 
-    return reconcileSubmission(id, message ? message : "indeterminate submitblock retry response") >= 0;
+    const DaemonReconciliation::SubmitDecision::Outcome policyOutcome =
+        outcome == SubmitResult::Outcome::Rejected
+            ? DaemonReconciliation::SubmitDecision::Outcome::Rejected
+            : DaemonReconciliation::SubmitDecision::Outcome::Indeterminate;
+    if (DaemonReconciliation::shouldRetrySubmit(policyOutcome, pending.attempts)) {
+        pending.retryDueMs = DaemonReconciliation::nextSubmitAttemptAt(
+            Chrono::steadyMSecs());
+
+        std::string message = "submitblock attempt ";
+        message += std::to_string(pending.attempts);
+        message += " of ";
+        message += std::to_string(DaemonReconciliation::kMaxSubmitAttempts);
+        message += " did not return status OK; attempt ";
+        message += std::to_string(pending.attempts + 1);
+        message += " is scheduled in ";
+        message += std::to_string(DaemonReconciliation::kRetryDelayMs);
+        message += " ms: ";
+        message += pending.lastSubmitError;
+        publishSubmissionRow("submit_block_attempt", pending, id,
+                             "retry_scheduled", message.c_str(), errorCode);
+        return true;
+    }
+
+    // If any request had an indeterminate response, it might have reached and
+    // been accepted by the daemon before its response was lost. Later explicit
+    // rejections cannot prove otherwise, so exhaustion remains ambiguous.
+    const DaemonReconciliation::SubmitDecision::Outcome terminalOutcome =
+        DaemonReconciliation::terminalSubmitOutcome(
+            policyOutcome, pending.hadIndeterminateOutcome);
+    const SubmitResult::Outcome finalOutcome =
+        terminalOutcome == DaemonReconciliation::SubmitDecision::Outcome::Rejected
+            ? SubmitResult::Outcome::Rejected
+            : SubmitResult::Outcome::Ambiguous;
+
+    std::string message = finalOutcome == SubmitResult::Outcome::Rejected
+        ? "submitblock rejected after "
+        : "submitblock outcome ambiguous after ";
+    message += std::to_string(pending.attempts);
+    message += " attempts; last response: ";
+    message += pending.lastSubmitError;
+
+    return finalizeSubmission(id, finalOutcome, message.c_str(), errorCode);
 }
 
 
-int64_t DaemonClient::retrySubmission(int64_t id, const char *reason)
+int64_t DaemonClient::retrySubmission(int64_t id)
 {
     auto it = m_pendingSubmissions.find(id);
-    if (it == m_pendingSubmissions.end() || it->second.attempts >= 2) {
+    if (it == m_pendingSubmissions.end() ||
+        !it->second.retryDueMs ||
+        !DaemonReconciliation::hasRemainingSubmitAttempts(it->second.attempts)) {
         return -1;
     }
 
     PendingSubmission submission(std::move(it->second));
     m_pendingSubmissions.erase(it);
-    submission.lastIndeterminateError = reason ? reason : "indeterminate submitblock response";
-    publishSubmissionRow("submit_block_attempt", submission, id, "retryable_error",
-                         submission.lastIndeterminateError.c_str());
 
     using namespace rapidjson;
     Document doc(kObjectType);
@@ -799,116 +800,23 @@ int64_t DaemonClient::retrySubmission(int64_t id, const char *reason)
     const int64_t requestId = m_sequence;
     JsonRequest::create(doc, requestId, "submitblock", params);
     submission.attempts++;
+    submission.retryDueMs = 0;
     submission.attemptStartedMs = Chrono::steadyMSecs();
     m_pendingSubmissions[requestId] = std::move(submission);
 
     PendingSubmission &pending = m_pendingSubmissions[requestId];
-    std::string message = "attempt 2 of 2 after: ";
-    message += pending.lastIndeterminateError;
+    std::string message = "submitblock attempt ";
+    message += std::to_string(pending.attempts);
+    message += " of ";
+    message += std::to_string(DaemonReconciliation::kMaxSubmitAttempts);
+    message += " after: ";
+    message += pending.lastSubmitError;
     publishSubmissionRow("submit_block_retry", pending, requestId, "requested",
                          message.c_str());
 
     std::map<std::string, std::string> headers;
     headers.insert({"X-Hash-Difficulty", std::to_string(pending.result.actualDiff)});
     return rpcSend(doc, headers, kHttpSubmit);
-}
-
-
-int64_t DaemonClient::reconcileSubmission(int64_t id, const char *reason)
-{
-    auto it = m_pendingSubmissions.find(id);
-    if (it == m_pendingSubmissions.end()) {
-        return -1;
-    }
-
-    PendingSubmission submission(std::move(it->second));
-    m_pendingSubmissions.erase(it);
-    if (submission.lastIndeterminateError.empty()) {
-        submission.lastIndeterminateError = reason ? reason : "indeterminate submitblock outcome";
-    }
-
-    using namespace rapidjson;
-    Document doc(kObjectType);
-    Value params(kObjectType);
-    params.AddMember("hash", submission.expectedBlockId.toJSON(doc), doc.GetAllocator());
-
-    const int64_t requestId = m_sequence;
-    JsonRequest::create(doc, requestId, "get_block_header_by_hash", params);
-    submission.attemptStartedMs = Chrono::steadyMSecs();
-    m_pendingSubmissions[requestId] = std::move(submission);
-
-    PendingSubmission &pending = m_pendingSubmissions[requestId];
-    std::string message = "checking expected block id after: ";
-    message += reason ? reason : pending.lastIndeterminateError;
-    publishSubmissionRow("submit_block_reconcile", pending, requestId, "requested",
-                         message.c_str());
-
-    return rpcSend(doc, {}, kHttpReconcile);
-}
-
-
-bool DaemonClient::parseReconcileResponse(int64_t id, const rapidjson::Value &result,
-                                          const rapidjson::Value &error)
-{
-    auto it = m_pendingSubmissions.find(id);
-    if (it == m_pendingSubmissions.end()) {
-        return false;
-    }
-
-    if (error.IsObject()) {
-        std::string rpcMessage;
-        if (!jsonString(error, "message", rpcMessage)) {
-            return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous,
-                                      "submitblock outcome ambiguous; malformed block lookup error");
-        }
-
-        std::string notFound = "Internal error: can't get block by hash. Hash = ";
-        notFound += it->second.expectedBlockId.data() ? it->second.expectedBlockId.data() : "";
-        notFound += '.';
-        const bool definitelyAbsent = rpcMessage == notFound;
-        if (definitelyAbsent && !it->second.retryRejection.empty()) {
-            std::string message = it->second.retryRejection;
-            message += "; reconciliation confirmed the expected block id is absent";
-            return finalizeSubmission(id, SubmitResult::Outcome::Rejected, message.c_str(),
-                                      it->second.retryRejectionCode, nullptr, true);
-        }
-
-        std::string message = "submitblock outcome ambiguous; block lookup failed: ";
-        message += rpcMessage;
-        return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous, message.c_str(),
-                                  Json::getInt64(error, "code", 0));
-    }
-
-    if (!result.IsObject()) {
-        return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous,
-                                  "submitblock outcome ambiguous; invalid block lookup response");
-    }
-
-    std::string status;
-    const bool validStatus = jsonString(result, "status", status);
-    const rapidjson::Value &header = Json::getObject(result, "block_header");
-    std::string hash;
-    uint8_t decodedHash[BlockTemplate::kHashSize];
-    const bool validHash = header.IsObject() && jsonString(header, "hash", hash) &&
-        hash.size() == sizeof(decodedHash) * 2 &&
-        Cvt::fromHex(decodedHash, sizeof(decodedHash), hash.c_str(), hash.size());
-    String normalizedHash(validHash ? hash.c_str() : nullptr, validHash ? hash.size() : 0);
-    normalizedHash.toLower();
-    if (validStatus && status == "OK" && validHash &&
-        it->second.expectedBlockId == normalizedHash) {
-        std::string message = "accepted after block-id reconciliation; earlier response: ";
-        message += it->second.lastIndeterminateError;
-        if (!it->second.retryRejection.empty()) {
-            message += "; retry response: ";
-            message += it->second.retryRejection;
-        }
-        return finalizeSubmission(id, SubmitResult::Outcome::Accepted, message.c_str(),
-                                  0, it->second.expectedBlockId.data(), true);
-    }
-
-    std::string message = "submitblock outcome ambiguous; block lookup did not return expected id ";
-    message += it->second.expectedBlockId.data() ? it->second.expectedBlockId.data() : "";
-    return finalizeSubmission(id, SubmitResult::Outcome::Ambiguous, message.c_str());
 }
 
 
@@ -946,8 +854,7 @@ void DaemonClient::publishSubmissionRow(const char *event, const PendingSubmissi
         row.errorCode = errorCode;
     }
     row.errorMessage = message ? message : "";
-    row.blockId = blockId ? blockId
-        : (submission.expectedBlockId.data() ? submission.expectedBlockId.data() : "");
+    row.blockId = blockId ? blockId : "";
     row.minerTxHash = submission.minerTxHash.data() ? submission.minerTxHash.data() : "";
     if (includeBlockBlob) {
         row.submittedBlockBlob = submission.blockBlob.data() ? submission.blockBlob.data() : "";
@@ -958,7 +865,7 @@ void DaemonClient::publishSubmissionRow(const char *event, const PendingSubmissi
 
 bool DaemonClient::finalizeSubmission(int64_t id, SubmitResult::Outcome outcome,
                                       const char *message, int64_t errorCode,
-                                      const char *blockId, bool reconciled)
+                                      const char *blockId)
 {
     auto it = m_pendingSubmissions.find(id);
     if (it == m_pendingSubmissions.end()) {
@@ -972,9 +879,6 @@ bool DaemonClient::finalizeSubmission(int64_t id, SubmitResult::Outcome outcome,
     std::string telemetryMessage;
     if (message) {
         telemetryMessage = message;
-    }
-    if (reconciled && outcome == SubmitResult::Outcome::Rejected && telemetryMessage.empty()) {
-        telemetryMessage = "reconciled as rejected";
     }
 
     const char *status = "ambiguous";

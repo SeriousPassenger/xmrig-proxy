@@ -834,22 +834,27 @@ class SQLiteStoreTest(unittest.TestCase):
                 source_id=1, template_id=2, share_id=7, job_id="job-a",
                 height=99, share_diff=5000, network_target_diff=10000,
             )
-            for sequence, event, request_id in (
-                (1, "submit_block", 10),
-                (2, "submit_block_attempt", 10),
-                (3, "submit_block_retry", 11),
-                (4, "submit_block_reconcile", 12),
+            for sequence, event, request_id, status in (
+                (1, "submit_block", 10, "requested"),
+                (2, "submit_block_attempt", 10, "retry_scheduled"),
+                (3, "submit_block_retry", 11, "requested"),
+                (4, "submit_block_attempt", 11, "retry_scheduled"),
+                (5, "submit_block_retry", 12, "requested"),
+                (6, "submit_block_attempt", 12, "retry_scheduled"),
+                (7, "submit_block_retry", 13, "requested"),
             ):
                 store.enqueue_event(self.event(
                     sequence, event=event, daemon_request_id=request_id,
-                    status="requested", submitted_block_blob="aa", **common,
+                    status=status,
+                    submitted_block_blob="aa" if event == "submit_block" else "",
+                    **common,
                 ), 1)
             store.enqueue_event(self.event(
-                5, event="submit_block_result", daemon_request_id=12,
+                8, event="submit_block_result", daemon_request_id=13,
                 status="accepted", block_id="b" * 64, submitted_block_blob="aa", **common,
             ), 1)
             store.enqueue_event(self.event(
-                6, event="share_result", status="accepted_upstream",
+                9, event="share_result", status="accepted_upstream",
                 miner_target_diff=100, **common,
             ), 1)
             store.close()
@@ -860,9 +865,16 @@ class SQLiteStoreTest(unittest.TestCase):
             result_audit = events.json.loads(detail["blocks"][0]["result_json"])
             self.assertEqual(
                 [item["event"] for item in attempts],
-                ["submit_block", "submit_block_attempt", "submit_block_retry", "submit_block_reconcile"],
+                [
+                    "submit_block", "submit_block_attempt", "submit_block_retry",
+                    "submit_block_attempt", "submit_block_retry",
+                    "submit_block_attempt", "submit_block_retry",
+                ],
             )
-            self.assertEqual([item["daemon_request_id"] for item in attempts], ["10", "10", "11", "12"])
+            self.assertEqual(
+                [item["daemon_request_id"] for item in attempts],
+                ["10", "10", "11", "11", "12", "12", "13"],
+            )
             self.assertEqual(submit_audit["submitted_block_blob"], "aa")
             self.assertTrue(all(not item["submitted_block_blob"] for item in attempts))
             self.assertEqual(result_audit["submitted_block_blob"], "")
