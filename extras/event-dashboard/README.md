@@ -7,8 +7,9 @@ scrollable dashboard on `127.0.0.1`.
 
 The dashboard provides:
 
-- a bounded live event timeline with search, category filters, pause/follow,
-  and full row details;
+- an IndexedDB-backed event timeline with search, category filters,
+  exact-connection tracing, an exact minimum-share-difficulty filter,
+  connection UUIDs, full row details, and ordered multi-row JSON copying;
 - daemon template-source height, age, refresh reason, error state, and
   process-global RandomX verifier seed lifecycle;
 - worker connection, job, share, and block-submission events;
@@ -19,11 +20,17 @@ The dashboard provides:
   per-worker statistics, with rates auto-scaled from H/s through TH/s and the
   exact raw API kH/s value preserved in tooltips/details, plus validated
   daemon-solo payout destinations exposed by the summary API;
+- optional authenticated Monero wallet RPC polling that shows and durably
+  records confirmed coinbase/block-reward transfers only;
 - persistent rounds, exact credited work, difficulty-normalized effort,
   successful block submissions, every 20G+ share, and the top 1,000 shares in
   each round; and
 - RandomX verifier request/error/mismatch totals, queue/hash/total latency,
   live capacity, and previous/current/next seed state.
+
+Template-source age remains healthy through 40 seconds, becomes a warning after
+40 seconds, and becomes an error only after 80 seconds (two missed 40-second
+poll windows).
 
 ## Run it
 
@@ -88,6 +95,31 @@ worker buckets update every four seconds. The dashboard requests only
 which exposes downstream login and password fields. Each workers sample is
 bracketed by two summaries so a proxy restart during the sample is detected
 instead of combining counters from different process epochs.
+
+To include view-only wallet mining rewards, supply both the local wallet RPC
+endpoint and its `--rpc-login` value. If either argument is absent, the
+dashboard does not create a wallet RPC connection:
+
+```bash
+python3 extras/event-dashboard/xmrig_events_web.py \
+  /run/xmrig-proxy/events.sock \
+  --database /var/lib/xmrig-proxy/dashboard.sqlite3 \
+  --wallet-rpc-url http://127.0.0.1:18082/json_rpc \
+  --wallet-rpc-login 'USER:PASS'
+```
+
+The default wallet interval is 20 seconds. Every `get_transfers` poll creates a
+fresh HTTP opener and Digest-auth context, sends `Connection: close`, and
+authenticates that JSON-RPC call independently; it never treats a previous
+challenge nonce or connection as a login session. Only incoming transfers whose
+wallet RPC `type` is `block` are allowlisted. Ordinary incoming payments,
+outgoing, pool, pending, and failed transfers are neither sent to the browser
+nor stored. The sanitized transaction ID, atomic reward, height, block time,
+confirmations, lock state, and account/subaddress indexes are upserted into the
+`wallet_transfers` SQLite table. The login remains backend-only and is never
+placed in HTML, SSE state, SQLite, or logs. See Monero's
+[wallet RPC documentation](https://www.getmonero.org/resources/developer-guides/wallet-rpc.html#get_transfers)
+for the upstream JSON-RPC fields.
 
 ## Open it through SSH
 
@@ -198,8 +230,81 @@ most recent rounds shown in the overview table.
   separate so a coverage gap or reconciliation difference is visible rather
   than silently combined.
 
-The bearer token exists only in the Python backend's memory. It is not included
-in browser responses, events, logs, or the dashboard page.
+The API bearer token and wallet RPC login exist only in the Python backend's
+memory. They are not included in browser responses, events, SQLite, logs, or
+the dashboard page.
+
+## Connection correlation and JSON copying
+
+Every timeline event with a `miner_id` receives a dashboard-derived
+`connection_uuid`. For schema v3, it is a deterministic UUIDv5 derived from the
+proxy's random process-lifetime `stream_id` and that process's connection-local
+`miner_id`. It therefore stays identical for every event from one miner
+connection, including across dashboard socket reconnects or dashboard process
+restarts, while a new proxy process or new miner connection receives a different
+UUID. This is dashboard metadata, not an extra event-stream column. For legacy
+schema v2 input, which has no durable stream identity, the fallback UUID is
+deliberately limited to one observed dashboard socket session so reused miner
+IDs are never silently merged.
+
+The existing `miner_id`/`mapper_id` display is also materialized as a
+`miner_label` such as `m13/p23`. This makes the exact composite shown in the
+timeline searchable and includes it in copied JSON without changing the proxy
+event schema.
+
+Clicking a timeline row still opens that one row in the JSON inspector, whose
+**Copy JSON** button copies a single JSON object. Use the row checkboxes (or the
+header checkbox for all currently visible rows) and **Copy selected JSON** to
+copy multiple complete rows as one valid JSON array. Selected rows are emitted
+in timeline order, independent of the order in which their checkboxes were
+clicked. Filtering and page reloads do not discard selections. **Follow
+connection** filters the timeline by the selected row's exact
+`connection_uuid`; it never uses a mutable mapper ID or potentially shared
+worker label. The minimum share difficulty control compares decimal strings
+with JavaScript `BigInt`, preserving exact values above the safe integer range.
+The filtered renderer walks newest rows first and stops after 1,000 matches
+instead of serializing every retained row into the DOM.
+
+The browser retains approximately 50,000 ordinary compact event rows (subject
+to a quota-derived byte budget) in IndexedDB and automatically prunes only the
+oldest unselected ordinary rows in batches. Selected rows are pinned and are
+never removed by automatic pruning. The cap applies to ordinary, unselected
+history; explicit selections and error archives are exceptions.
+
+A rejected share/result, an exact stale-share outcome, or a real error/fatal/
+retryable-error event starts a permanent incident archive containing up to 100
+first-seen rows before it, the trigger row, and the next 100 first-seen rows.
+Thus a fully observed isolated incident contains 201 rows. Overlapping windows
+deduplicate by stable event key. Periodic warning/degraded telemetry and
+accepted rows that merely carry explanatory error text do not create archive
+storms. The **Errors archive** category shows trigger and context rows, marked
+with an amber edge. Ordinary pruning and **Clear normal history** cannot delete
+them; only the separately confirmed **Clear errors** action does. A storage
+quota failure is made visible rather than silently claiming the archive is
+durable. **Clear errors** deliberately removes every archived context row and
+any selection attached to one of those rows.
+
+Schema-v3 browser-history keys use the exact `(stream_id,event_seq)` event
+identity. Viewer-generated and legacy schema-v2 rows use the dashboard's random
+process-lifetime `viewer_instance_id` plus `_viewer_seq`, preventing a dashboard
+restart from attaching an old selection to an unrelated replacement row. The
+browser-only ordering/search metadata is non-enumerable and is not included in
+the JSON copied for debugging. Durable per-viewer and per-stream sequence
+high-water marks prevent automatically pruned rows from being re-ingested on a
+later snapshot. If a reconnect skips sequence numbers, an open incident window
+is marked incomplete and stopped instead of filling its 100-row after-context
+with unrelated later events.
+
+A short IndexedDB writer lease prevents two tabs from racing selection,
+archive, and clear transactions. Every mutation verifies the lease owner,
+per-page token, and monotonic generation in the same transaction; a stale or
+suspended page therefore cannot write after a new owner takes over. A normal
+same-tab refresh can reclaim its lease immediately, while a second simultaneous
+tab remains visibly memory-only. If IndexedDB is unavailable or reaches its
+browser quota, the dashboard remains live in memory, disables persistent clear
+actions, and reports the storage failure in the `history` badge. The SSE
+connection opens before history hydration, so events received while retained
+rows are loading are buffered and merged in arrival order.
 
 ## Coverage and memory bounds
 
@@ -211,10 +316,11 @@ replayed. A first sequence above one, later event-sequence gap, parser error,
 ingestion row/byte queue overflow, or ambiguous API counter decrease likewise
 marks coverage incomplete instead of fabricating missing work.
 
-The Python timeline defaults to at most 5,000 compact rows **and** a 16 MiB byte
-budget; each browser applies the same byte budget and renders at most the latest
-1,000 filtered rows. Full hashing/template/submission blobs are replaced in the
-live ring/SSE with exact omitted-size metadata and remain available from the
+The Python SSE snapshot defaults to at most 5,000 compact rows **and** a 16 MiB
+byte budget. Each browser merges that snapshot into its IndexedDB-backed
+50,000-row history and renders at most the latest 1,000 filtered rows. Full
+hashing/template/submission blobs are replaced in the live ring/SSE with exact
+omitted-size metadata and remain available from the
 normalized retained-share/block audit views. Schema-v3 input records may be up
 to 8 MiB, matching the producer's per-reader pending-write limit. Change the
 backend row-count bound with `--max-events`. The
