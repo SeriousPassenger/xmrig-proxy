@@ -26,7 +26,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import (
+    HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm,
+    HTTPRedirectHandler, ProxyHandler, Request, build_opener,
+)
 
 
 DEFAULT_SOCKET = "/run/xmrig-proxy/events.sock"
@@ -34,6 +37,7 @@ DEFAULT_PORT = 8787
 DEFAULT_DATABASE = "xmrig-events.sqlite3"
 DEFAULT_BIG_SHARE_DIFFICULTY = 20_000_000_000
 DEFAULT_ROUND_TOP_SHARES = 1000
+DEFAULT_WALLET_RPC_INTERVAL = 20.0
 MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_BROWSER_SUBSCRIBERS = 5
 MAX_SSE_QUEUE_BYTES = 16 * 1024 * 1024
@@ -145,7 +149,7 @@ def compact_live_row(row: Dict[str, Any], limit: int = MAX_LIVE_ROW_BYTES) -> Tu
         # identity/status fields if an unexpectedly wide future schema arrives.
         keep = {
             "schema_version", "event_seq", "time_utc", "event", "stream_id",
-            "miner_id", "mapper_id", "worker", "source_id", "template_id",
+            "miner_id", "mapper_id", "miner_label", "connection_uuid", "worker", "source_id", "template_id",
             "height", "job_id", "share_id", "status", "error_code",
             "error_message", "share_diff", "miner_target_diff",
             "network_target_diff", "block_id", "seed_hash",
@@ -523,6 +527,49 @@ def api_worker_hash_total(document: Dict[str, Any]) -> Tuple[Optional[int], str]
     return total, ""
 
 
+def sanitize_wallet_transfers(document: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Allowlist confirmed coinbase rewards returned by ``get_transfers``.
+
+    Current monero-wallet-rpc labels an incoming miner transaction ``block``.
+    Ordinary incoming payments and every outgoing/pending/failed category are
+    deliberately excluded from both browser state and SQLite persistence.
+    """
+    values = document.get("in") if isinstance(document.get("in"), list) else []
+    transfers: List[Dict[str, Any]] = []
+    for value in values[:10000]:
+        if not isinstance(value, dict) or value.get("type") != "block":
+            continue
+        txid = value.get("txid")
+        if (
+            not isinstance(txid, str) or len(txid) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in txid)
+        ):
+            continue
+        amount = value.get("amount")
+        if type(amount) is not int or amount < 0:
+            continue
+        subaddress = value.get("subaddr_index")
+        if not isinstance(subaddress, dict):
+            subaddress = {}
+        transfers.append({
+            "txid": txid.lower(),
+            "type": "block",
+            "amount_atomic": str(amount),
+            "height": max(0, _integer(value.get("height"))),
+            "timestamp": max(0, _integer(value.get("timestamp"))),
+            "confirmations": max(0, _integer(value.get("confirmations"))),
+            "unlock_time": str(value.get("unlock_time", "0"))[:32],
+            "locked": value.get("locked") is True,
+            "account_index": max(0, _integer(subaddress.get("major"))),
+            "subaddress_index": max(0, _integer(subaddress.get("minor"))),
+        })
+    transfers.sort(
+        key=lambda item: (item["height"], item["timestamp"], item["txid"]),
+        reverse=True,
+    )
+    return transfers
+
+
 class SQLiteStore:
     """Single-writer durable statistics store.
 
@@ -531,7 +578,7 @@ class SQLiteStore:
     cannot stall share handling or the event reader.
     """
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, path: str, big_share_difficulty: int = DEFAULT_BIG_SHARE_DIFFICULTY,
                  round_top_limit: int = DEFAULT_ROUND_TOP_SHARES,
@@ -573,6 +620,7 @@ class SQLiteStore:
             "recent_blocks": [],
             "big_shares": [],
             "big_share_count": 0,
+            "wallet_transfers": [],
             "cumulative": {},
             "verifier": {},
         }
@@ -784,9 +832,24 @@ class SQLiteStore:
                         updated_utc TEXT NOT NULL,
                         active INTEGER NOT NULL DEFAULT 1
                     );
-                    PRAGMA user_version=7;
+                    CREATE TABLE IF NOT EXISTS wallet_transfers (
+                        txid TEXT PRIMARY KEY,
+                        amount_atomic TEXT NOT NULL,
+                        height INTEGER NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        confirmations INTEGER NOT NULL,
+                        unlock_time TEXT NOT NULL,
+                        locked INTEGER NOT NULL,
+                        account_index INTEGER NOT NULL,
+                        subaddress_index INTEGER NOT NULL,
+                        first_seen_utc TEXT NOT NULL,
+                        last_seen_utc TEXT NOT NULL,
+                        row_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS wallet_transfers_height ON wallet_transfers(height DESC,timestamp DESC);
+                    PRAGMA user_version=8;
                 """)
-            version = 7
+            version = 8
         if version == 1:
             self._apply_migration(db, """
                     CREATE TABLE job_contexts (
@@ -846,6 +909,26 @@ class SQLiteStore:
                     CREATE INDEX IF NOT EXISTS job_contexts_retained_budget ON job_contexts(retained,id DESC,size_bytes);
                     CREATE INDEX IF NOT EXISTS template_contexts_retained_budget ON template_contexts(retained,id DESC,size_bytes);
                     PRAGMA user_version=7;
+                """)
+            version = 7
+        if version == 7:
+            self._apply_migration(db, """
+                    CREATE TABLE IF NOT EXISTS wallet_transfers (
+                        txid TEXT PRIMARY KEY,
+                        amount_atomic TEXT NOT NULL,
+                        height INTEGER NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        confirmations INTEGER NOT NULL,
+                        unlock_time TEXT NOT NULL,
+                        locked INTEGER NOT NULL,
+                        account_index INTEGER NOT NULL,
+                        subaddress_index INTEGER NOT NULL,
+                        first_seen_utc TEXT NOT NULL,
+                        last_seen_utc TEXT NOT NULL,
+                        row_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS wallet_transfers_height ON wallet_transfers(height DESC,timestamp DESC);
+                    PRAGMA user_version=8;
                 """)
 
     @staticmethod
@@ -966,6 +1049,11 @@ class SQLiteStore:
     def enqueue_api(self, summary: Dict[str, Any], workers: Dict[str, Any]) -> bool:
         return self._enqueue("api", (dict(summary), dict(workers), utc_now(), time.time()))
 
+    def enqueue_wallet_transfers(self, transfers: Sequence[Dict[str, Any]]) -> bool:
+        return self._enqueue(
+            "wallet", ([dict(value) for value in transfers], utc_now()),
+        )
+
     def mark_incomplete(self, reason: str) -> bool:
         return self._enqueue("incomplete", str(reason)[:512])
 
@@ -1016,6 +1104,14 @@ class SQLiteStore:
             "WHERE is_big=1 ORDER BY time_utc DESC LIMIT 100"
         ).fetchall()
         big_count = int(db.execute("SELECT count(*) FROM shares WHERE is_big=1").fetchone()[0])
+        wallet_rows = [dict(value) for value in db.execute(
+            "SELECT txid,amount_atomic,height,timestamp,confirmations,unlock_time,locked,"
+            "account_index,subaddress_index,first_seen_utc,last_seen_utc "
+            "FROM wallet_transfers ORDER BY height DESC,timestamp DESC LIMIT 500"
+        ).fetchall()]
+        for value in wallet_rows:
+            value["locked"] = bool(value.get("locked"))
+            value["type"] = "block"
         verifier = self._row_dict(db.execute("SELECT * FROM verifier_totals WHERE id=1").fetchone())
         seeds = [dict(value) for value in db.execute(
             "SELECT * FROM verifier_seeds WHERE active=1 ORDER BY "
@@ -1073,6 +1169,7 @@ class SQLiteStore:
             "recent_blocks": [dict(value) for value in block_rows],
             "big_shares": [dict(value) for value in big_rows],
             "big_share_count": big_count,
+            "wallet_transfers": wallet_rows,
             "cumulative": {
                 "credited_hashes_events": event_total,
                 "observed_share_difficulty_sum": self._meta_get(db, "observed_diff_total", "0"),
@@ -1756,6 +1853,34 @@ class SQLiteStore:
         self._meta_set(db, "api_status", status)
         return True
 
+    def _handle_wallet(self, db: sqlite3.Connection,
+                       payload: Tuple[List[Dict[str, Any]], str]) -> bool:
+        transfers, observed_utc = payload
+        for transfer in transfers:
+            db.execute(
+                "INSERT INTO wallet_transfers("
+                "txid,amount_atomic,height,timestamp,confirmations,unlock_time,locked,"
+                "account_index,subaddress_index,first_seen_utc,last_seen_utc,row_json"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(txid) DO UPDATE SET "
+                "amount_atomic=excluded.amount_atomic,height=excluded.height,"
+                "timestamp=excluded.timestamp,confirmations=excluded.confirmations,"
+                "unlock_time=excluded.unlock_time,locked=excluded.locked,"
+                "account_index=excluded.account_index,subaddress_index=excluded.subaddress_index,"
+                "last_seen_utc=excluded.last_seen_utc,row_json=excluded.row_json",
+                (
+                    transfer["txid"], transfer["amount_atomic"], transfer["height"],
+                    transfer["timestamp"], transfer["confirmations"],
+                    transfer["unlock_time"], int(transfer["locked"]),
+                    transfer["account_index"], transfer["subaddress_index"],
+                    observed_utc, observed_utc,
+                    json.dumps(transfer, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+        self._meta_set(db, "wallet_rpc_last_utc", observed_utc)
+        self._meta_set(db, "wallet_rpc_status", "tracking")
+        return True
+
     def _run(self) -> None:
         db: Optional[sqlite3.Connection] = None
         failed = False
@@ -1792,6 +1917,8 @@ class SQLiteStore:
                             refresh = self._handle_event(db, payload) or refresh
                         elif kind == "api":
                             refresh = self._handle_api(db, payload) or refresh
+                        elif kind == "wallet":
+                            refresh = self._handle_wallet(db, payload) or refresh
                         elif kind == "incomplete":
                             db.execute(
                                 "UPDATE rounds SET coverage_complete=0 WHERE id=?",
@@ -1926,6 +2053,8 @@ class DashboardState:
 
     def __init__(self, socket_path: str, max_events: int, top_limit: int,
                  api_enabled: bool = False, api_interval: float = 5.0,
+                 wallet_enabled: bool = False,
+                 wallet_interval: float = DEFAULT_WALLET_RPC_INTERVAL,
                  store: Optional[SQLiteStore] = None,
                  live_byte_limit: int = MAX_LIVE_RING_BYTES) -> None:
         self.socket_path = socket_path
@@ -1947,6 +2076,12 @@ class DashboardState:
         self._viewer_sequence = 0
         self._source_sequence: Optional[int] = None
         self._session = 0
+        self._viewer_instance_id = uuid.uuid4().hex
+        # Schema v3 can derive a stable connection identity from the proxy's
+        # process-lifetime stream ID and its process-unique miner ID.  Schema v2
+        # has no stream identity, so give each observed dashboard session a
+        # separate namespace rather than accidentally merging reused miner IDs.
+        self._connection_namespace = uuid.uuid4()
         self._connected = False
         self._coverage_complete = False
         self._reader_status = "starting"
@@ -1961,6 +2096,14 @@ class DashboardState:
             "interval_seconds": api_interval,
             "summary": {},
             "workers": [],
+        }
+        self._wallet: Dict[str, Any] = {
+            "enabled": wallet_enabled,
+            "status": "waiting" if wallet_enabled else "disabled",
+            "message": "waiting for monero-wallet-rpc" if wallet_enabled else "wallet RPC polling is not configured",
+            "last_update_utc": "",
+            "interval_seconds": wallet_interval,
+            "transfers": [],
         }
         if self.store is not None:
             self.store.set_update_callback(self.persistence_updated)
@@ -1984,6 +2127,7 @@ class DashboardState:
             "reader_message": self._reader_message,
             "coverage_complete": self._coverage_complete,
             "session": self._session,
+            "viewer_instance_id": self._viewer_instance_id,
             "started_utc": self._started_utc,
             "last_event_utc": self._last_event_utc,
             "socket_path": self.socket_path,
@@ -2001,7 +2145,8 @@ class DashboardState:
         return self.store.share_detail(event_key) if self.store is not None else None
 
     def _state_locked(self, include_api: bool = True,
-                      include_persistence: bool = True) -> Dict[str, Any]:
+                      include_persistence: bool = True,
+                      include_wallet: bool = True) -> Dict[str, Any]:
         rejected = (
             self._counters["share_result:rejected_local"]
             + self._counters["share_result:rejected_upstream"]
@@ -2046,6 +2191,8 @@ class DashboardState:
             )
         if include_api:
             result["api"] = dict(self._api)
+        if include_wallet:
+            result["wallet"] = dict(self._wallet)
         return result
 
     def _sources_json_locked(self) -> List[Dict[str, Any]]:
@@ -2132,7 +2279,9 @@ class DashboardState:
 
         # API worker arrays can be large and change only on the API poller.
         # Do not copy/send/re-render them for every high-rate mining event.
-        payload = self._state_locked(include_api=False, include_persistence=False)
+        payload = self._state_locked(
+            include_api=False, include_persistence=False, include_wallet=False,
+        )
         payload.update({"kind": "update", "viewer_seq": self._viewer_sequence, "row": dict(row)})
         self._broadcast_locked(payload)
 
@@ -2227,9 +2376,41 @@ class DashboardState:
             self.store.mark_api_incomplete(message)
         self.api_error(message)
 
+    def update_wallet(self, transfers: Sequence[Dict[str, Any]]) -> None:
+        """Publish only sanitized coinbase rewards; credentials never enter state."""
+        sanitized = [dict(value) for value in transfers]
+        with self._lock:
+            if self.store is not None:
+                self.store.enqueue_wallet_transfers(sanitized)
+            interval = self._wallet.get("interval_seconds", DEFAULT_WALLET_RPC_INTERVAL)
+            self._wallet = {
+                "enabled": True,
+                "status": "connected",
+                "message": "authenticated monero-wallet-rpc poll complete",
+                "last_update_utc": utc_now(),
+                "interval_seconds": interval,
+                "transfers": sanitized[:500],
+            }
+            payload = self._state_locked()
+            payload.update({"kind": "state", "viewer_seq": self._viewer_sequence})
+            self._broadcast_locked(payload)
+
+    def wallet_error(self, message: str) -> None:
+        with self._lock:
+            if self._wallet.get("status") == "error" and self._wallet.get("message") == message:
+                return
+            self._wallet["enabled"] = True
+            self._wallet["status"] = "error"
+            self._wallet["message"] = str(message)[:512]
+            payload = self._state_locked()
+            payload.update({"kind": "state", "viewer_seq": self._viewer_sequence})
+            self._broadcast_locked(payload)
+
     def persistence_updated(self) -> None:
         with self._lock:
-            payload = self._state_locked(include_api=False, include_persistence=True)
+            payload = self._state_locked(
+                include_api=False, include_persistence=True, include_wallet=False,
+            )
             payload.update({"kind": "state", "viewer_seq": self._viewer_sequence})
             self._broadcast_locked(payload)
 
@@ -2254,6 +2435,37 @@ class DashboardState:
                     if not result.get(name):
                         result[name] = context.get(name, "")
         return result
+
+    def _connection_uuid_locked(self, row: Dict[str, Any]) -> str:
+        miner_id = str(row.get("miner_id", ""))
+        if not miner_id:
+            return ""
+
+        stream_id = str(row.get("stream_id", ""))
+        if stream_id:
+            try:
+                namespace = uuid.UUID(hex=stream_id)
+            except ValueError:
+                # A parsed v3 row cannot reach this branch, but direct callers
+                # and future schemas should still fail closed to session scope.
+                namespace = self._connection_namespace
+                name = f"xmrig-proxy/viewer-session/{self._session}/miner/{miner_id}"
+            else:
+                name = f"xmrig-proxy/miner/{miner_id}"
+        else:
+            namespace = self._connection_namespace
+            name = f"xmrig-proxy/viewer-session/{self._session}/miner/{miner_id}"
+
+        return str(uuid.uuid5(namespace, name))
+
+    @staticmethod
+    def _miner_label(row: Dict[str, Any]) -> str:
+        """Return the dashboard's searchable rendering of one miner mapping."""
+        miner_id = str(row.get("miner_id", ""))
+        if not miner_id:
+            return ""
+        mapper_id = str(row.get("mapper_id", ""))
+        return f"m{miner_id}" + (f"/p{mapper_id}" if mapper_id else "")
 
     def _remember_share_locked(self, row: Dict[str, Any]) -> None:
         share_id = row.get("share_id", "")
@@ -2314,7 +2526,7 @@ class DashboardState:
             return
 
         miner = self._miners.setdefault(miner_id, {"miner_id": miner_id})
-        for name in ("mapper_id", "worker", "miner_ip", "agent", "source_id"):
+        for name in ("mapper_id", "miner_label", "connection_uuid", "worker", "miner_ip", "agent", "source_id"):
             if row.get(name):
                 miner[name] = row[name]
         if event == "worker_login":
@@ -2380,6 +2592,8 @@ class DashboardState:
             "share_id": row.get("share_id", ""),
             "miner_id": row.get("miner_id", ""),
             "mapper_id": row.get("mapper_id", ""),
+            "miner_label": row.get("miner_label", ""),
+            "connection_uuid": row.get("connection_uuid", ""),
             "worker": row.get("worker", ""),
             "height": row.get("height", ""),
             "status": row.get("status", ""),
@@ -2418,6 +2632,10 @@ class DashboardState:
             self._source_sequence = sequence
 
             resolved = self._resolve_identity_locked(row)
+            connection_uuid = self._connection_uuid_locked(resolved)
+            if connection_uuid:
+                resolved["connection_uuid"] = connection_uuid
+                resolved["miner_label"] = self._miner_label(resolved)
             event = resolved["event"]
             status = resolved.get("status", "")
             self._counters[event] += 1
@@ -2667,6 +2885,103 @@ class ApiPoller(threading.Thread):
             self.stop_event.wait(max(0.05, self.interval - elapsed))
 
 
+class WalletRpcPoller(threading.Thread):
+    """Poll coinbase rewards with a fresh Digest-auth context per RPC call."""
+
+    MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+    def __init__(self, endpoint: str, username: str, password: str,
+                 interval: float, state: DashboardState,
+                 stop_event: threading.Event) -> None:
+        super().__init__(name="monero-wallet-rpc-poller", daemon=True)
+        self.endpoint = endpoint
+        self.username = username
+        self.password = password
+        self.interval = interval
+        self.state = state
+        self.stop_event = stop_event
+
+    def _new_opener(self) -> Any:
+        # monero-wallet-rpc's --rpc-login uses HTTP Digest. A new password
+        # manager/opener is intentionally built for every JSON-RPC call so a
+        # challenge nonce or authenticated connection is never treated as a
+        # reusable login session.
+        passwords = HTTPPasswordMgrWithDefaultRealm()
+        passwords.add_password(None, self.endpoint, self.username, self.password)
+        return build_opener(
+            ProxyHandler({}), NoRedirectHandler(), HTTPDigestAuthHandler(passwords),
+        )
+
+    def _call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": "dashboard", "method": method,
+            "params": params,
+        }, separators=(",", ":")).encode("utf-8")
+        request = Request(
+            self.endpoint, data=body, method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Connection": "close",
+                "User-Agent": "xmrig-event-dashboard/1",
+            },
+        )
+        opener = self._new_opener()
+        with opener.open(
+            request, timeout=min(15.0, max(3.0, self.interval * 0.75)),
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f"wallet RPC returned HTTP {response.status}")
+            encoded = response.read(self.MAX_RESPONSE_BYTES + 1)
+        if len(encoded) > self.MAX_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"wallet RPC response exceeds {self.MAX_RESPONSE_BYTES} bytes"
+            )
+        try:
+            document = json.loads(encoded.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"wallet RPC returned invalid JSON: {exc}") from exc
+        if not isinstance(document, dict):
+            raise RuntimeError("wallet RPC JSON is not an object")
+        error = document.get("error")
+        if isinstance(error, dict):
+            code = error.get("code", "unknown")
+            message = str(error.get("message", "RPC error"))[:256]
+            raise RuntimeError(f"wallet RPC error {code}: {message}")
+        result = document.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("wallet RPC result is not an object")
+        return result
+
+    @staticmethod
+    def _error_message(exc: BaseException) -> str:
+        if isinstance(exc, HTTPError):
+            if exc.code in (401, 403):
+                return f"wallet RPC Digest authentication failed (HTTP {exc.code})"
+            return f"wallet RPC returned HTTP {exc.code}"
+        if isinstance(exc, URLError):
+            return f"wallet RPC connection failed: {exc.reason}"
+        return f"wallet RPC poll failed: {exc}"
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            try:
+                result = self._call("get_transfers", {
+                    "in": True,
+                    "out": False,
+                    "pending": False,
+                    "failed": False,
+                    "pool": False,
+                    "all_accounts": True,
+                })
+                self.state.update_wallet(sanitize_wallet_transfers(result))
+            except (HTTPError, URLError, OSError, RuntimeError) as exc:
+                self.state.wallet_error(self._error_message(exc))
+            elapsed = time.monotonic() - started
+            self.stop_event.wait(max(0.05, self.interval - elapsed))
+
+
 HTML = r'''<!doctype html>
 <html lang="en">
 <head>
@@ -2702,6 +3017,9 @@ HTML = r'''<!doctype html>
     th { position:sticky; top:0; z-index:1; text-align:left; color:var(--muted); background:#11181e; font-size:10px; letter-spacing:.08em; text-transform:uppercase; }
     th,td { padding:9px 10px; border-bottom:1px solid #202a32; }
     tbody tr { cursor:pointer; } tbody tr:hover { background:#172129; }
+    tbody tr.event-archived { box-shadow:inset 3px 0 var(--amber); }
+    tbody tr.event-selected { background:#173036; box-shadow:inset 3px 0 var(--cyan); }
+    tbody tr.event-selected:hover { background:#1b3a41; }
     .status-accepted,.status-updated,.status-healthy { color:var(--green); }
     .status-rejected,.status-error,.status-fatal { color:var(--red); }
     .status-requested,.status-warning,.status-degraded { color:var(--amber); }
@@ -2709,8 +3027,13 @@ HTML = r'''<!doctype html>
     .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
     input,select,button { border:1px solid var(--line); background:#0d1318; border-radius:7px; padding:7px 9px; }
     input { min-width:210px; flex:1; } button { cursor:pointer; } button:hover { border-color:#536572; }
+    input[aria-invalid="true"] { border-color:var(--red); box-shadow:0 0 0 1px #ff716c44; }
+    #minShareDiff { max-width:260px; } #traceState { max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    button:disabled { cursor:not-allowed; opacity:.5; border-color:var(--line); }
     label.check { color:var(--muted); display:flex; align-items:center; gap:5px; }
     label.check input { min-width:0; flex:none; }
+    .selection-cell { width:34px; min-width:34px; padding-left:8px; padding-right:8px; text-align:center; }
+    .row-select { width:14px; height:14px; min-width:0; padding:0; margin:0; vertical-align:middle; accent-color:var(--cyan); }
     .details { height:calc(58vh + 54px); min-height:484px; overflow:auto; }
     .details pre { margin:0; color:#cbd5dc; white-space:pre-wrap; word-break:break-word; font:12px/1.55 inherit; }
     .empty { color:var(--muted); padding:24px; text-align:center; }
@@ -2744,7 +3067,7 @@ HTML = r'''<!doctype html>
 <div class="shell">
   <header>
     <div><h1>XMRig Proxy Event Dashboard</h1><div class="sub">Read-only schema-v2/v3 observer · localhost only</div></div>
-    <div class="badges"><span id="browserBadge" class="badge">dashboard: connecting</span><span id="socketBadge" class="badge">socket: starting</span><span id="apiBadge" class="badge">API: disabled</span><span id="dbBadge" class="badge">database: starting</span><span id="verifierBadge" class="badge">verifier: waiting</span><span id="coverageBadge" class="badge">coverage: observed</span><span id="sessionBadge" class="badge">session 0</span></div>
+    <div class="badges"><span id="browserBadge" class="badge">dashboard: connecting</span><span id="historyBadge" class="badge">history: opening</span><span id="socketBadge" class="badge">socket: starting</span><span id="apiBadge" class="badge">API: disabled</span><span id="walletBadge" class="badge">wallet: disabled</span><span id="dbBadge" class="badge">database: starting</span><span id="verifierBadge" class="badge">verifier: waiting</span><span id="coverageBadge" class="badge">coverage: observed</span><span id="sessionBadge" class="badge">session 0</span></div>
   </header>
 
   <section class="cards">
@@ -2823,6 +3146,11 @@ HTML = r'''<!doctype html>
     <div class="scroll top-scroll"><table><thead><tr><th>Worker</th><th>Connections</th><th>Hashrate 1m</th><th>Hashrate 10m</th><th>Accepted</th><th>Rejected</th><th>Invalid</th><th>Credited hashes</th></tr></thead><tbody id="apiWorkersBody"></tbody></table><div id="apiWorkersEmpty" class="empty">Supply --api-url and an API token to enable these statistics.</div></div>
   </section>
 
+  <section id="walletPanel" class="panel" style="margin-top:10px">
+    <div class="panel-head"><div><h2>Monero mining wallet rewards</h2><div class="sub">Optional authenticated view-only wallet RPC · confirmed coinbase transfers only · durably recorded in SQLite</div></div><span id="walletUpdated" class="muted">not configured</span></div>
+    <div class="scroll top-scroll"><table><thead><tr><th>Block time</th><th>Height</th><th>Reward</th><th>Confirmations</th><th>State</th><th>Account / subaddress</th><th>Transaction ID</th></tr></thead><tbody id="walletTransfersBody"></tbody></table><div id="walletTransfersEmpty" class="empty">Supply --wallet-rpc-url and --wallet-rpc-login to poll mining rewards.</div></div>
+  </section>
+
   <section class="panel">
     <div class="panel-head"><div><h2 id="topTitle">Top 5 observed accepted shares</h2><div class="sub">Ranked by accepted share difficulty; verifier-computed when enabled; times are exact event times</div></div><span id="topCompleteness" class="badge">observed window</span></div>
     <div class="scroll top-scroll"><table><thead><tr><th>#</th><th>Time (browser local)</th><th>Share difficulty</th><th>Miner</th><th>Worker</th><th>Height</th><th>Result</th></tr></thead><tbody id="topBody"></tbody></table><div id="topEmpty" class="empty">No accepted shares observed yet.</div></div>
@@ -2832,32 +3160,49 @@ HTML = r'''<!doctype html>
     <div class="panel">
       <div class="panel-head"><h2>Live event timeline</h2><span id="eventCount" class="muted">0 rows</span></div>
       <div class="controls" style="margin-bottom:10px">
-        <select id="category"><option value="all">All events</option><option value="shares">Shares</option><option value="blocks">Blocks</option><option value="templates">Templates</option><option value="workers">Workers</option><option value="errors">Errors</option></select>
-        <input id="search" type="search" placeholder="Filter miner, worker, event, status, ID…" autocomplete="off">
-        <button id="pause">Pause view</button><button id="clear">Clear view</button>
+        <select id="category"><option value="all">All events</option><option value="shares">Shares</option><option value="blocks">Blocks</option><option value="templates">Templates</option><option value="workers">Workers</option><option value="errors">Errors archive</option></select>
+        <input id="search" type="search" placeholder="Filter miner, connection UUID, worker, event, status, ID…" autocomplete="off">
+        <input id="minShareDiff" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" spellcheck="false" placeholder="Minimum share difficulty…">
+        <span id="minDiffState" class="details-copy-state"></span><span id="traceState" class="badge" hidden></span><button id="clearTrace" disabled>Clear trace</button>
+        <button id="pause">Pause view</button><button id="clear" disabled>Clear normal history</button><button id="clearErrors" disabled>Clear errors</button>
+        <button id="copySelected" disabled>Copy selected JSON (0)</button><button id="clearSelected" disabled>Clear selection</button><span id="selectionState" class="details-copy-state"></span>
         <label class="check"><input id="follow" type="checkbox" checked> follow</label>
       </div>
-      <div id="eventsScroll" class="scroll events-scroll"><table><thead><tr><th>Time (local)</th><th>Event</th><th>Miner</th><th>Source/template</th><th>Height</th><th>Share diff</th><th>Status</th><th>Details</th></tr></thead><tbody id="eventsBody"></tbody></table></div>
+      <div id="eventsScroll" class="scroll events-scroll"><table><thead><tr><th class="selection-cell"><input id="selectVisible" class="row-select" type="checkbox" aria-label="Select all visible events"></th><th>Time (local)</th><th>Event</th><th>Connection UUID</th><th>Miner</th><th>Source/template</th><th>Height</th><th>Share diff</th><th>Status</th><th>Details</th></tr></thead><tbody id="eventsBody"></tbody></table></div>
     </div>
-    <aside class="panel details"><div class="panel-head"><h2>JSON inspector</h2><div class="details-toolbar"><span id="copyState" class="details-copy-state"></span><button id="copyDetails">Copy JSON</button><button id="closeDetails">Clear</button></div></div><pre id="details" class="json-code">Select a timeline, share, block, seed, worker, or round row to inspect every field.</pre></aside>
+    <aside class="panel details"><div class="panel-head"><h2>JSON inspector</h2><div class="details-toolbar"><span id="copyState" class="details-copy-state"></span><button id="followConnection" disabled>Follow connection</button><button id="copyDetails">Copy JSON</button><button id="closeDetails">Clear</button></div></div><pre id="details" class="json-code">Select a timeline, share, block, seed, worker, or round row to inspect every field.</pre></aside>
   </section>
 
   <footer><span id="lastEvent">No events received.</span><span>Only 127.0.0.1 is served; transport it with SSH local forwarding.</span></footer>
 </div>
 <script>
 (() => {
-  const model = { events: [], eventSizes: [], maxEvents: 5000, liveByteLimit: 16777216, eventBytes: 0, stats: {}, sources: [], top: [], topLimit: 5, health: {}, api: {}, persistence: {}, lastViewerSeq: 0, paused: false, pending: 0, stateAt: Date.now(), detailsText: '' };
+  const BROWSER_EVENT_LIMIT = 50000;
+  const BROWSER_PRUNE_BATCH = 500;
+  const BROWSER_EVENT_BYTE_LIMIT = 256*1024*1024;
+  const BROWSER_BYTE_PRUNE_BATCH = 8*1024*1024;
+  const INCIDENT_CONTEXT_ROWS = 100;
+  const STORAGE_LEASE_MS = 15000;
+  const STORAGE_LEASE_HEARTBEAT_MS = 5000;
+  const BROWSER_DB_NAME = 'xmrig-proxy-event-dashboard-v1';
+  const BROWSER_DB_VERSION = 2;
+  const randomBrowserId = () => globalThis.crypto&&crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random()}`;
+  const storageOwnerId = (() => {try{const key='xmrig-dashboard-tab-id',existing=sessionStorage.getItem(key);if(existing)return existing;const created=randomBrowserId();sessionStorage.setItem(key,created);return created;}catch(_){return randomBrowserId();}})();
+  const model = { events: [], eventKeys: new Set(), eventRows: new Map(), eventBytes: 0, protectedEventKeys: new Set(), incidentTriggerKeys: new Set(), incidentTailOrder: 0, incidentIncomplete: false, selectedEventKeys: new Set(), unpinnedCount: 0, unpinnedBytes: 0, viewerInstanceId: '', nextEventOrder: 0, maxEvents: BROWSER_EVENT_LIMIT, maxEventBytes: BROWSER_EVENT_BYTE_LIMIT, stats: {}, sources: [], top: [], topLimit: 5, health: {}, api: {}, wallet: {}, persistence: {}, lastViewerSeq: 0, paused: false, pending: 0, stateAt: Date.now(), detailsText: '', detailValue: null, traceConnectionUuid: '', traceConnectionLabel: '', minShareDiff: null, browserDb: null, browserStorageStatus: 'opening', browserStorageMessage: 'Opening IndexedDB event history', storageOwnerId, storageLeaseToken: randomBrowserId(), storageLeaseGeneration: 0, storageGeneration: 0, storageSuspended: false, clearWatermarks: {}, seenPositions: {current_viewer:'',viewers:{},streams:{}}, historyIncomplete: false };
   const $ = id => document.getElementById(id);
   const nf = new Intl.NumberFormat('en-US');
+  const utf8Encoder = new TextEncoder();
+  const templateAgeClass = ageMs => ageMs>80000?'status-error':ageMs>40000?'status-warning':'status-healthy';
   const groups = {
     shares: e => e.startsWith('share_') || e.startsWith('verify_') || e === 'candidate_verify_fallback',
     blocks: e => e.startsWith('submit_block') || e === 'candidate_verify_fallback',
     templates: e => e.includes('template') || e.startsWith('daemon_height') || e === 'daemon_tip_changed' || e.startsWith('verifier_seed_') || e === 'zmq_new_block',
     workers: e => e.startsWith('worker_'),
-    errors: (e, r) => e.includes('error') || e === 'verify_mismatch' || ['error','fatal','degraded','warning','mismatch','rejected','rejected_local','rejected_upstream'].includes(r.status)
+    errors: (_e, r) => model.protectedEventKeys.has(eventKey(r))
   };
   const missing = value => value === null || value === undefined || value === '';
   const exact = value => { if (missing(value)) return '—'; try { return BigInt(value).toLocaleString('en-US'); } catch (_) { return String(value); } };
+  const xmrAmount = value => {try{const atomic=BigInt(String(value)),whole=atomic/1000000000000n,fraction=(atomic%1000000000000n).toString().padStart(12,'0').replace(/0+$/,'');return `${whole.toLocaleString('en-US')}${fraction?`.${fraction}`:''} XMR`;}catch(_){return '—';}};
   const compact = value => { if (missing(value)) return '—'; const n = Number(value); if (!Number.isFinite(n)) return String(value); const units=['','K','M','G','T','P','E']; let x=n,i=0; while(Math.abs(x)>=1000&&i<units.length-1){x/=1000;i++;} return `${x>=100?x.toFixed(0):x>=10?x.toFixed(1):x.toFixed(2)}${units[i]}`; };
   const hashrate = (value, inputUnit='H/s') => { if(missing(value))return '—';const n=Number(value),factors={'H/s':1,'kH/s':1e3,'MH/s':1e6,'GH/s':1e9,'TH/s':1e12};if(!Number.isFinite(n)||n<0||!Object.prototype.hasOwnProperty.call(factors,inputUnit))return '—';let x=n*factors[inputUnit],i=0;const units=['H/s','kH/s','MH/s','GH/s','TH/s'];while(x>=1000&&i<units.length-1){x/=1000;i++;}const shown=x>=100?x.toFixed(0):x>=10?x.toFixed(1):x.toFixed(2);return `${shown} ${units[i]}`; };
   const rateTitle = value => missing(value)||!Number.isFinite(Number(value))||Number(value)<0?'':`raw API: ${String(value)} kH/s`;
@@ -2873,6 +3218,12 @@ HTML = r'''<!doctype html>
     if(value && typeof value==='object'){const out={};for(const [key,item] of Object.entries(value)){if(key.endsWith('_json')&&typeof item==='string'){try{out[key]=jsonReady(JSON.parse(item));continue;}catch(_){}}out[key]=jsonReady(item);}return out;}
     return value;
   };
+  const deriveEventKey = (row,viewerInstanceId='') => {if(!row||typeof row!=='object')return '';if(row.stream_id&&!missing(row.event_seq))return `stream:${row.stream_id}:${row.event_seq}`;const sequence=!missing(row._viewer_seq)?row._viewer_seq:row.event_seq;return viewerInstanceId&&!missing(sequence)?`viewer:${viewerInstanceId}:${sequence}`:'';};
+  const attachEventMeta = (row,key,order,storedBytes=null) => {const serialized=JSON.stringify(row),bytes=storedBytes===null?utf8Encoder.encode(serialized).length:Number(storedBytes);Object.defineProperty(row,'__event_key',{value:key,writable:true,configurable:true});Object.defineProperty(row,'__event_order',{value:order,writable:true,configurable:true});Object.defineProperty(row,'__event_bytes',{value:Number.isFinite(bytes)&&bytes>=0?bytes:0,configurable:true});Object.defineProperty(row,'__search_text',{value:serialized.toLowerCase(),configurable:true});return row;};
+  const eventKey = row => row&&row.__event_key?row.__event_key:deriveEventKey(row,model.viewerInstanceId);
+  const selectedRows = (rows, selected) => rows.filter(row => {const key=eventKey(row);return key&&selected.has(key);});
+  const jsonText = value => JSON.stringify(jsonReady(value),null,2);
+  const selectedJson = (rows, selected) => jsonText(selectedRows(rows,selected));
   const escapeHtml = value => value.replace(/[&<>"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[char]));
   const jsonHtml = value => JSON.stringify(jsonReady(value),null,2).replace(/("(?:\\u[0-9a-fA-F]{4}|\\[^u]|[^\\"])*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?/g,(token,isString,isKey,literal)=>{if(isString)return `<span class="${isKey?'json-key':'json-string'}">${escapeHtml(isString)}</span>${isKey||''}`;if(literal)return `<span class="json-literal">${literal}</span>`;return `<span class="json-number">${token}</span>`;});
   const detailText = row => {
@@ -2885,22 +3236,72 @@ HTML = r'''<!doctype html>
     if(row.job_id) parts.push(`job ${short(row.job_id)}`);
     return parts.join(' · ') || '—';
   };
-  const eventSize = row => JSON.stringify(row).length*2;
-  const trimEvents = rebuild => {if(rebuild){model.eventSizes=model.events.map(eventSize);model.eventBytes=model.eventSizes.reduce((sum,size)=>sum+size,0);}while(model.events.length&&(model.events.length>model.maxEvents||model.eventBytes>model.liveByteLimit)){model.events.shift();model.eventBytes-=model.eventSizes.shift();}};
+  const INCIDENT_REJECTED = new Set(['rejected','rejected_local','rejected_upstream']);
+  const INCIDENT_ERRORS = new Set(['error','fatal','retryable_error']);
+  const normalizedText = value => String(value??'').trim().toLowerCase();
+  const incidentKind = row => {const event=normalizedText((row||{}).event),status=normalizedText((row||{}).status),code=String((row||{}).error_code??'').trim(),message=normalizedText((row||{}).error_message);if(event==='share_result'&&(status==='stale'||status==='stale_share'||(status==='rejected_local'&&(code==='15'||message==='stale share'))))return 'stale';if(INCIDENT_REJECTED.has(status))return 'rejected';if(INCIDENT_ERRORS.has(status)||event.endsWith('_error'))return 'error';return '';};
+  const isIncidentTrigger = row => incidentKind(row)!=='';
+  const incidentPriorRows = rows => rows.slice(Math.max(0,rows.length-(INCIDENT_CONTEXT_ROWS+1)));
+  const incidentTailEnd = triggerOrder => Number(triggerOrder)+INCIDENT_CONTEXT_ROWS;
+  const parseMinimumDifficulty = value => {const text=String(value??'').trim();if(!text)return null;if(!/^\d+$/.test(text))return undefined;try{return BigInt(text);}catch(_){return undefined;}};
+  const matchesMinimumDifficulty = (row,minimum) => {if(minimum===null)return true;if(!row||missing(row.share_diff))return false;try{return BigInt(String(row.share_diff))>=minimum;}catch(_){return false;}};
+  const newestMatchingEvents = (rows,{categoryFn=null,query='',connectionUuid='',minimumDifficulty=null,limit=1000}={}) => {const result=[],needle=query.trim().toLowerCase();for(let index=rows.length-1;index>=0&&result.length<limit;index--){const row=rows[index];if(categoryFn&&!categoryFn(row.event||'',row))continue;if(connectionUuid&&String(row.connection_uuid||'')!==connectionUuid)continue;if(!matchesMinimumDifficulty(row,minimumDifficulty))continue;if(needle&&!(row.__search_text||'').includes(needle))continue;result.push(row);}result.reverse();return result;};
+  const oldestUnselectedKeys = (rows,selected,protectedKeys,count,bytes=0) => {const result=[];let freed=0;for(const row of rows){const key=eventKey(row);if(key&&!selected.has(key)&&!protectedKeys.has(key)){result.push(key);freed+=Number(row.__event_bytes||0);if(result.length>=count&&freed>=bytes)break;}}return result;};
+  const sequenceBigInt = value => {const text=String(value??'');if(!/^\d+$/.test(text))return null;try{return BigInt(text);}catch(_){return null;}};
+  const positionMap = value => {const result={};if(!value||typeof value!=='object')return result;for(const [key,sequence] of Object.entries(value)){const parsed=sequenceBigInt(sequence);if(parsed!==null)result[String(key)]=parsed.toString();}return result;};
+  const normalizeSeenPositions = value => ({current_viewer:String((value||{}).current_viewer||''),viewers:positionMap((value||{}).viewers),streams:positionMap((value||{}).streams)});
+  const cloneSeenPositions = value => ({current_viewer:String(value.current_viewer||''),viewers:{...value.viewers},streams:{...value.streams}});
+  const setPositionMax = (map,key,value) => {const next=sequenceBigInt(value);if(!key||next===null)return false;const current=sequenceBigInt(map[key])||0n;if(next<=current)return false;map[key]=next.toString();return true;};
+  const rowStreamPosition = row => row&&row.stream_id&&sequenceBigInt(row.event_seq)!==null?[String(row.stream_id),String(row.event_seq)]:['',''];
+  const rowAlreadySeen = (row,instance='') => {const [stream,streamSequence]=rowStreamPosition(row);if(stream&&sequenceBigInt(model.seenPositions.streams[stream])>=sequenceBigInt(streamSequence))return true;const viewerSequence=sequenceBigInt((row||{})._viewer_seq),seenViewer=sequenceBigInt(model.seenPositions.viewers[instance]);return Boolean(instance&&viewerSequence!==null&&seenViewer!==null&&viewerSequence<=seenViewer);};
+  const snapshotHasSequenceGap = (instance,incomingSequence,rows) => {const previous=sequenceBigInt(model.seenPositions.viewers[instance]),incoming=sequenceBigInt(incomingSequence);if(previous!==null&&previous>0n&&incoming!==null&&incoming>previous){const unseen=rows.map(row=>sequenceBigInt(row._viewer_seq)).filter(value=>value!==null&&value>previous);if(!unseen.length||unseen.reduce((a,b)=>a<b?a:b)>previous+1n)return true;}const firstByStream={};for(const row of rows){const [stream,raw]=rowStreamPosition(row),sequence=sequenceBigInt(raw),seen=sequenceBigInt(model.seenPositions.streams[stream]);if(!stream||sequence===null||seen===null||sequence<=seen)continue;if(firstByStream[stream]===undefined||sequence<firstByStream[stream])firstByStream[stream]=sequence;}for(const [stream,first] of Object.entries(firstByStream)){const seen=sequenceBigInt(model.seenPositions.streams[stream]);if(seen!==null&&seen>0n&&first>seen+1n)return true;}return false;};
+  const pendingEventWrites=new Map(),pendingEventDeletes=new Set(),pendingSelectionWrites=new Map();
+  let storageFlushTimer=null,storageFlushing=false,storageClearing=false,storageUrgent=false,storageQuotaRetries=0,storageLeaseTimer=null,heartbeatPending=false,positionsDirty=false,incidentStateDirty=false,storageIdleWaiters=[];
 
-  function applyState(data) {
-    const apiChanged=Object.prototype.hasOwnProperty.call(data,'api');
-    model.maxEvents=data.max_events??model.maxEvents; model.liveByteLimit=data.live_event_byte_limit??model.liveByteLimit; model.stats=data.stats||{}; model.sources=data.sources||[]; model.top=data.top_shares||[]; model.topLimit=data.top_limit??5; model.health=data.health||{}; model.persistence=data.persistence||model.persistence||{}; if(apiChanged)model.api=data.api||{}; model.stateAt=Date.now();
-    $('topTitle').textContent=`Top ${model.topLimit} observed accepted shares`;
-    renderHeader(); renderCards(); renderSources(); if(apiChanged)renderApi(); renderTop(); renderPersistence(); renderVerifier();
+  function renderStorageBadge(){const badge=$('historyBadge');if(!badge)return;const status=model.browserStorageStatus,archive=model.protectedEventKeys.size;badge.textContent=`history: ${status} · ${nf.format(model.events.length)} · errors ${nf.format(archive)}`;badge.title=`${model.browserStorageMessage||''} · ${compact(model.eventBytes)}B stored${model.historyIncomplete?' · a reconnect gap was detected':''}${model.incidentIncomplete?' · an error archive has incomplete after-context':''}`;badge.className=`badge ${status==='ready'&&!model.historyIncomplete?'ok':status==='error'?'bad':'warn'}`;}
+  function setBrowserStorageStatus(status,message){model.browserStorageStatus=status;model.browserStorageMessage=String(message||'');const writable=status==='ready';if($('clear'))$('clear').disabled=!writable;if($('clearErrors'))$('clearErrors').disabled=!writable;renderStorageBadge();}
+  const idbRequest = request => new Promise((resolve,reject)=>{request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error||new Error('IndexedDB request failed'));});
+  const idbTransaction = transaction => new Promise((resolve,reject)=>{transaction.oncomplete=()=>resolve();transaction.onerror=()=>reject(transaction.error||new Error('IndexedDB transaction failed'));transaction.onabort=()=>reject(transaction.error||new Error('IndexedDB transaction aborted'));});
+  function openBrowserDb(){return new Promise((resolve,reject)=>{if(typeof indexedDB==='undefined'){reject(new Error('IndexedDB is unavailable'));return;}const request=indexedDB.open(BROWSER_DB_NAME,BROWSER_DB_VERSION);request.onupgradeneeded=()=>{const db=request.result;if(!db.objectStoreNames.contains('events')){const events=db.createObjectStore('events',{keyPath:'key'});events.createIndex('order','order');}if(!db.objectStoreNames.contains('selections'))db.createObjectStore('selections',{keyPath:'key'});if(!db.objectStoreNames.contains('meta'))db.createObjectStore('meta',{keyPath:'key'});};request.onsuccess=()=>{const db=request.result;db.onversionchange=()=>db.close();resolve(db);};request.onerror=()=>reject(request.error||new Error('Could not open IndexedDB'));request.onblocked=()=>reject(new Error('IndexedDB upgrade is blocked by another dashboard tab'));});}
+  function acquireBrowserLease(db){return new Promise((resolve,reject)=>{const transaction=db.transaction('meta','readwrite'),store=transaction.objectStore('meta'),request=store.get('writer_lease');let denied='',generation=0;request.onsuccess=()=>{const lease=request.result,now=Date.now();if(lease&&lease.owner!==model.storageOwnerId&&Number(lease.expires||0)>now){denied='another dashboard tab owns persistent browser history';transaction.abort();return;}generation=Math.max(0,Number((lease||{}).generation)||0)+1;store.put({key:'writer_lease',owner:model.storageOwnerId,token:model.storageLeaseToken,generation,expires:now+STORAGE_LEASE_MS});};request.onerror=()=>{denied='could not read the browser-history lease';transaction.abort();};transaction.oncomplete=()=>{model.storageLeaseGeneration=generation;resolve();};transaction.onabort=()=>reject(new Error(denied||'could not acquire the browser-history lease'));transaction.onerror=()=>{};});}
+  function fencedMutation(storeNames,mutate){const db=model.browserDb;if(!db)return Promise.reject(new Error('IndexedDB is unavailable'));return new Promise((resolve,reject)=>{const names=[...new Set([...storeNames,'meta'])],transaction=db.transaction(names,'readwrite'),meta=transaction.objectStore('meta'),request=meta.get('writer_lease');let failure=null;request.onsuccess=()=>{const lease=request.result,valid=lease&&lease.owner===model.storageOwnerId&&lease.token===model.storageLeaseToken&&Number(lease.generation)===model.storageLeaseGeneration;if(!valid){failure=new Error('persistent browser-history lease is stale');transaction.abort();return;}try{meta.put({...lease,expires:Date.now()+STORAGE_LEASE_MS});mutate(transaction,meta,lease);}catch(error){failure=error;transaction.abort();}};request.onerror=()=>{failure=request.error||new Error('could not validate browser-history lease');transaction.abort();};transaction.oncomplete=()=>resolve();transaction.onabort=()=>reject(failure||transaction.error||new Error('IndexedDB mutation aborted'));transaction.onerror=()=>{};});}
+  async function heartbeatBrowserLease(){if(heartbeatPending||!model.browserDb||model.browserStorageStatus!=='ready'||model.storageSuspended)return;heartbeatPending=true;try{await fencedMutation([],()=>{});}catch(error){storageFailed(error);}finally{heartbeatPending=false;}}
+  function releaseBrowserLease(){if(!model.browserDb)return Promise.resolve();return fencedMutation([],(_transaction,meta,lease)=>meta.put({...lease,expires:0}));}
+  function storageFailed(error){if(storageFlushTimer!==null){clearTimeout(storageFlushTimer);storageFlushTimer=null;}if(storageLeaseTimer!==null){clearInterval(storageLeaseTimer);storageLeaseTimer=null;}pendingEventWrites.clear();pendingEventDeletes.clear();pendingSelectionWrites.clear();if(model.browserDb){try{model.browserDb.close();}catch(_){}model.browserDb=null;}setBrowserStorageStatus('error',`Browser history is memory-only: ${String(error)}`);}
+  function scheduleStorageFlush(delay=250){if(model.browserStorageStatus!=='ready'||!model.browserDb||storageClearing)return;if(storageFlushing){if(delay===0)storageUrgent=true;return;}if(delay===0&&storageFlushTimer!==null){clearTimeout(storageFlushTimer);storageFlushTimer=null;}if(storageFlushTimer!==null)return;storageFlushTimer=setTimeout(()=>{storageFlushTimer=null;flushBrowserStorage();},delay);}
+  function requestUrgentStorageFlush(){storageUrgent=true;if(!storageFlushing&&!storageClearing){storageUrgent=false;if(storageFlushTimer!==null){clearTimeout(storageFlushTimer);storageFlushTimer=null;}flushBrowserStorage();}}
+  async function flushBrowserStorage(){if(storageFlushing||storageClearing||model.browserStorageStatus!=='ready'||!model.browserDb)return;const writes=[...pendingEventWrites.values()],deletes=[...pendingEventDeletes],selections=[...pendingSelectionWrites.entries()],writePositions=positionsDirty,writeIncident=incidentStateDirty,seenPositions=cloneSeenPositions(model.seenPositions),incidentState={tail_order:model.incidentTailOrder,incomplete:model.incidentIncomplete},generation=model.storageGeneration;pendingEventWrites.clear();pendingEventDeletes.clear();pendingSelectionWrites.clear();positionsDirty=false;incidentStateDirty=false;if(!writes.length&&!deletes.length&&!selections.length&&!writePositions&&!writeIncident)return;storageFlushing=true;try{await fencedMutation(['events','selections'],(transaction,meta)=>{const eventStore=transaction.objectStore('events'),selectionStore=transaction.objectStore('selections'),selectionUpdates=new Map(selections);for(const key of deletes){if(selectionUpdates.get(key)===true)continue;eventStore.delete(key);selectionStore.delete(key);}for(const value of writes)eventStore.put(value);for(const [key,selected] of selections){if(selected)selectionStore.put({key});else selectionStore.delete(key);}if(writePositions)meta.put({key:'seen_positions',value:seenPositions});if(writeIncident)meta.put({key:'incident_state',value:incidentState});});storageQuotaRetries=0;}catch(error){if(generation===model.storageGeneration&&error&&error.name==='QuotaExceededError'&&storageQuotaRetries<2){storageQuotaRetries++;model.maxEventBytes=Math.max(4*1024*1024,Math.floor(model.maxEventBytes*.75));pruneBrowserEvents(true);for(const value of writes){if(model.eventKeys.has(value.key)&&!pendingEventWrites.has(value.key))pendingEventWrites.set(value.key,value);}for(const key of deletes){if(!model.eventKeys.has(key)&&!pendingEventWrites.has(key))pendingEventDeletes.add(key);}for(const [key,selected] of selections){if(!pendingSelectionWrites.has(key))pendingSelectionWrites.set(key,selected);}positionsDirty=positionsDirty||writePositions;incidentStateDirty=incidentStateDirty||writeIncident;setBrowserStorageStatus('ready',`IndexedDB quota pressure; retrying with a ${compact(model.maxEventBytes)}B ordinary-history budget`);}else if(generation===model.storageGeneration)storageFailed(error);}finally{storageFlushing=false;const urgent=storageUrgent,waiters=storageIdleWaiters;storageUrgent=false;storageIdleWaiters=[];for(const resolve of waiters)resolve();if(pendingEventWrites.size||pendingEventDeletes.size||pendingSelectionWrites.size||positionsDirty||incidentStateDirty)scheduleStorageFlush(urgent?0:250);}}
+  function queueEventWrite(row){if(model.browserStorageStatus!=='ready')return;const key=eventKey(row);if(!key)return;pendingEventDeletes.delete(key);pendingEventWrites.set(key,{key,order:row.__event_order,bytes:row.__event_bytes,protected:model.protectedEventKeys.has(key),incident_trigger:model.incidentTriggerKeys.has(key),row:Object.fromEntries(Object.entries(row))});scheduleStorageFlush();}
+  function queueEventDelete(key){if(!key||model.browserStorageStatus!=='ready')return;pendingEventWrites.delete(key);pendingEventDeletes.add(key);scheduleStorageFlush();}
+  function markEventSeen(row,instance=''){let changed=false;const [stream,sequence]=rowStreamPosition(row);if(stream)changed=setPositionMax(model.seenPositions.streams,stream,sequence)||changed;if(instance&&!missing((row||{})._viewer_seq))changed=setPositionMax(model.seenPositions.viewers,instance,row._viewer_seq)||changed;if(changed)positionsDirty=true;return changed;}
+  function restoreSeenFromRecord(row,key){markEventSeen(row);if(key&&key.startsWith('viewer:')){const split=key.lastIndexOf(':'),instance=key.slice(7,split),sequence=key.slice(split+1);if(setPositionMax(model.seenPositions.viewers,instance,sequence))positionsDirty=true;}}
+  function markViewerSeen(instance,sequence){let changed=false;if(instance&&model.seenPositions.current_viewer!==instance){model.seenPositions.current_viewer=instance;changed=true;}if(instance)changed=setPositionMax(model.seenPositions.viewers,instance,sequence)||changed;if(changed)positionsDirty=true;model.viewerInstanceId=instance||model.viewerInstanceId;model.lastViewerSeq=Number(model.seenPositions.viewers[instance]||0);}
+  function markHistoryGap(message){const openIncident=model.incidentTailOrder>0;model.historyIncomplete=true;model.browserStorageMessage=message;if(openIncident){model.incidentTailOrder=0;model.incidentIncomplete=true;incidentStateDirty=true;requestUrgentStorageFlush();}renderStorageBadge();}
+  function recomputeRetentionCounters(){let count=0,bytes=0;for(const row of model.events){const key=eventKey(row);if(key&&!model.selectedEventKeys.has(key)&&!model.protectedEventKeys.has(key)){count++;bytes+=Number(row.__event_bytes||0);}}model.unpinnedCount=count;model.unpinnedBytes=bytes;}
+  function protectEvent(row){const key=eventKey(row);if(!key||model.protectedEventKeys.has(key))return;model.protectedEventKeys.add(key);if(!model.selectedEventKeys.has(key)){model.unpinnedCount=Math.max(0,model.unpinnedCount-1);model.unpinnedBytes=Math.max(0,model.unpinnedBytes-Number(row.__event_bytes||0));}queueEventWrite(row);}
+  function updateSelections(keys,selected){const normalized=keys.filter(Boolean);for(const key of normalized){const wasSelected=model.selectedEventKeys.has(key);if(wasSelected===Boolean(selected))continue;const row=model.eventRows.get(key),isProtected=model.protectedEventKeys.has(key);if(selected){model.selectedEventKeys.add(key);if(row&&!isProtected){model.unpinnedCount=Math.max(0,model.unpinnedCount-1);model.unpinnedBytes=Math.max(0,model.unpinnedBytes-Number(row.__event_bytes||0));}if(row)queueEventWrite(row);}else{model.selectedEventKeys.delete(key);if(row&&!isProtected){model.unpinnedCount++;model.unpinnedBytes+=Number(row.__event_bytes||0);}}if(model.browserStorageStatus==='ready')pendingSelectionWrites.set(key,Boolean(selected));}if(model.browserStorageStatus==='ready'&&normalized.length)scheduleStorageFlush(0);if(!selected)pruneBrowserEvents(true);}
+  function watermarkScope(row,key=eventKey(row)){if(row&&row.stream_id&&!missing(row.event_seq))return [`stream:${row.stream_id}`,String(row.event_seq)];if(key&&key.startsWith('viewer:')){const split=key.lastIndexOf(':');return [key.slice(0,split),key.slice(split+1)];}return ['',''];}
+  function extendClearWatermarks(rows){for(const row of rows){const [scope,sequence]=watermarkScope(row);if(!scope||!/^\d+$/.test(sequence))continue;try{const next=BigInt(sequence),current=BigInt(String(model.clearWatermarks[scope]||'0'));if(next>current)model.clearWatermarks[scope]=next.toString();}catch(_){}}}
+  function shouldSkipCleared(row){const key=deriveEventKey(row,model.viewerInstanceId),[scope,sequence]=watermarkScope(row,key);if(!scope||!/^\d+$/.test(sequence))return false;try{return BigInt(sequence)<=BigInt(String(model.clearWatermarks[scope]||'0'));}catch(_){return false;}}
+  function addBrowserEvent(row,{persist=true,key='',order=null,bytes=null,protectedRow=false,incidentTrigger=false}={}){if(persist&&shouldSkipCleared(row))return false;const resolvedKey=key||deriveEventKey(row,model.viewerInstanceId);if(!resolvedKey||model.eventKeys.has(resolvedKey))return false;const resolvedOrder=order===null?++model.nextEventOrder:Number(order);model.nextEventOrder=Math.max(model.nextEventOrder,Number.isFinite(resolvedOrder)?resolvedOrder:0);attachEventMeta(row,resolvedKey,resolvedOrder,bytes);model.events.push(row);model.eventKeys.add(resolvedKey);model.eventRows.set(resolvedKey,row);model.eventBytes+=Number(row.__event_bytes||0);if(protectedRow)model.protectedEventKeys.add(resolvedKey);if(incidentTrigger)model.incidentTriggerKeys.add(resolvedKey);if(!model.protectedEventKeys.has(resolvedKey)&&!model.selectedEventKeys.has(resolvedKey)){model.unpinnedCount++;model.unpinnedBytes+=Number(row.__event_bytes||0);}if(persist){let urgent=false;const trigger=isIncidentTrigger(row);if(trigger){model.incidentTriggerKeys.add(resolvedKey);model.incidentTailOrder=Math.max(model.incidentTailOrder,incidentTailEnd(resolvedOrder));incidentStateDirty=true;for(const incidentRow of incidentPriorRows(model.events))protectEvent(incidentRow);urgent=true;}else if(model.incidentTailOrder>0&&resolvedOrder<=model.incidentTailOrder){protectEvent(row);urgent=true;if(resolvedOrder>=model.incidentTailOrder){model.incidentTailOrder=0;incidentStateDirty=true;}}queueEventWrite(row);if(urgent)requestUrgentStorageFlush();}return true;}
+  function removeEventKeys(keys,{persist=true}={}){const removed=new Set(keys),kept=[];for(const row of model.events){const key=eventKey(row);if(!removed.has(key)){kept.push(row);continue;}const selected=model.selectedEventKeys.has(key),protectedRow=model.protectedEventKeys.has(key);if(!selected&&!protectedRow){model.unpinnedCount=Math.max(0,model.unpinnedCount-1);model.unpinnedBytes=Math.max(0,model.unpinnedBytes-Number(row.__event_bytes||0));}model.eventBytes=Math.max(0,model.eventBytes-Number(row.__event_bytes||0));model.eventKeys.delete(key);model.eventRows.delete(key);model.selectedEventKeys.delete(key);model.protectedEventKeys.delete(key);model.incidentTriggerKeys.delete(key);if(persist)queueEventDelete(key);}model.events=kept;return removed.size;}
+  function pruneBrowserEvents(force=false){const countThreshold=force?model.maxEvents:model.maxEvents+BROWSER_PRUNE_BATCH,byteThreshold=force?model.maxEventBytes:model.maxEventBytes+BROWSER_BYTE_PRUNE_BATCH;if(model.unpinnedCount<=countThreshold&&model.unpinnedBytes<=byteThreshold)return 0;const countOver=Math.max(0,model.unpinnedCount-model.maxEvents),bytesOver=Math.max(0,model.unpinnedBytes-model.maxEventBytes),keys=oldestUnselectedKeys(model.events,model.selectedEventKeys,model.protectedEventKeys,countOver,bytesOver);return keys.length?removeEventKeys(keys):0;}
+  async function clearStoredHistory(keys){if(model.browserStorageStatus!=='ready'||!model.browserDb)return;storageClearing=true;if(storageFlushTimer!==null){clearTimeout(storageFlushTimer);storageFlushTimer=null;}if(storageFlushing)await new Promise(resolve=>storageIdleWaiters.push(resolve));if(model.browserStorageStatus!=='ready'||!model.browserDb){storageClearing=false;return;}const deleting=new Set(keys),carriedWrites=[...pendingEventWrites].filter(([key])=>!deleting.has(key)),carriedDeletes=[...pendingEventDeletes].filter(key=>!deleting.has(key)),carriedSelections=[...pendingSelectionWrites].filter(([key])=>!deleting.has(key)),seenPositions=cloneSeenPositions(model.seenPositions),incidentState={tail_order:model.incidentTailOrder,incomplete:model.incidentIncomplete};model.storageGeneration++;pendingEventWrites.clear();pendingEventDeletes.clear();pendingSelectionWrites.clear();positionsDirty=false;incidentStateDirty=false;try{await fencedMutation(['events','selections'],(transaction,meta)=>{const eventStore=transaction.objectStore('events'),selectionStore=transaction.objectStore('selections');for(const key of carriedDeletes){eventStore.delete(key);selectionStore.delete(key);}for(const [,value] of carriedWrites)eventStore.put(value);for(const [key,selected] of carriedSelections){if(selected)selectionStore.put({key});else selectionStore.delete(key);}for(const key of keys){eventStore.delete(key);selectionStore.delete(key);}meta.put({key:'clear_watermarks',value:model.clearWatermarks});meta.put({key:'seen_positions',value:seenPositions});meta.put({key:'incident_state',value:incidentState});});}catch(error){storageFailed(error);}finally{storageClearing=false;if(model.browserStorageStatus==='ready'&&(pendingEventWrites.size||pendingEventDeletes.size||pendingSelectionWrites.size||positionsDirty||incidentStateDirty))scheduleStorageFlush();}}
+  async function restoreBrowserHistory(){let db=null;try{db=await openBrowserDb();await acquireBrowserLease(db);model.browserDb=db;if(navigator.storage&&navigator.storage.estimate){const estimate=await navigator.storage.estimate(),quota=Number(estimate.quota);if(Number.isFinite(quota)&&quota>0)model.maxEventBytes=Math.min(BROWSER_EVENT_BYTE_LIMIT,Math.max(4*1024*1024,Math.floor(quota/2)));}const transaction=db.transaction(['events','selections','meta'],'readonly'),done=idbTransaction(transaction),meta=transaction.objectStore('meta'),recordsPromise=idbRequest(transaction.objectStore('events').index('order').getAll()),selectionsPromise=idbRequest(transaction.objectStore('selections').getAllKeys()),watermarksPromise=idbRequest(meta.get('clear_watermarks')),seenPromise=idbRequest(meta.get('seen_positions')),incidentPromise=idbRequest(meta.get('incident_state')),[records,selections,watermarks,seen,incident]=await Promise.all([recordsPromise,selectionsPromise,watermarksPromise,seenPromise,incidentPromise]);await done;model.clearWatermarks=watermarks&&watermarks.value&&typeof watermarks.value==='object'?watermarks.value:{};model.seenPositions=normalizeSeenPositions(seen&&seen.value);for(const record of records){if(record&&record.key&&record.row&&typeof record.row==='object'){addBrowserEvent(record.row,{persist:false,key:String(record.key),order:Number(record.order)||0,bytes:Number(record.bytes)||null,protectedRow:Boolean(record.protected),incidentTrigger:Boolean(record.incident_trigger)});restoreSeenFromRecord(record.row,String(record.key));}}const inferredTail=[...model.incidentTriggerKeys].reduce((tail,key)=>Math.max(tail,incidentTailEnd((model.eventRows.get(key)||{}).__event_order||0)),0),savedIncident=incident&&incident.value&&typeof incident.value==='object'?incident.value:null;model.incidentTailOrder=savedIncident?Math.max(0,Number(savedIncident.tail_order)||0):(inferredTail>model.nextEventOrder?inferredTail:0);model.incidentIncomplete=Boolean(savedIncident&&savedIncident.incomplete);model.historyIncomplete=model.historyIncomplete||model.incidentIncomplete;model.viewerInstanceId=model.seenPositions.current_viewer||'';model.lastViewerSeq=Number(model.seenPositions.viewers[model.viewerInstanceId]||0);model.selectedEventKeys=new Set(selections.map(String).filter(key=>model.eventKeys.has(key)));recomputeRetentionCounters();await fencedMutation([],()=>{});model.storageSuspended=false;setBrowserStorageStatus('ready',`IndexedDB keeps about ${nf.format(BROWSER_EVENT_LIMIT)} ordinary rows or ${compact(model.maxEventBytes)}B; selections and 201-row error windows are pinned`);storageLeaseTimer=setInterval(heartbeatBrowserLease,STORAGE_LEASE_HEARTBEAT_MS);pruneBrowserEvents(true);if(positionsDirty||incidentStateDirty)scheduleStorageFlush(0);scheduleTimeline(false);}catch(error){if(db){try{db.close();}catch(_){}}model.browserDb=null;setBrowserStorageStatus('error',`Browser history is memory-only: ${String(error)}`);}}
+
+  let stateRenderTimer=null,stateApiChanged=false,stateWalletChanged=false;
+  function renderStateNow(){if(stateRenderTimer!==null){clearTimeout(stateRenderTimer);stateRenderTimer=null;}const apiChanged=stateApiChanged,walletChanged=stateWalletChanged;stateApiChanged=false;stateWalletChanged=false;$('topTitle').textContent=`Top ${model.topLimit} observed accepted shares`;renderHeader();renderCards();renderSources();if(apiChanged)renderApi();if(walletChanged)renderWallet();renderTop();renderPersistence();renderVerifier();}
+  function scheduleStateRender(immediate=false){if(immediate){renderStateNow();return;}if(stateRenderTimer!==null)return;stateRenderTimer=setTimeout(renderStateNow,100);}
+  function applyState(data,immediate=false) {
+    const apiChanged=Object.prototype.hasOwnProperty.call(data,'api'),walletChanged=Object.prototype.hasOwnProperty.call(data,'wallet');
+    model.stats=data.stats||{};model.sources=data.sources||[];model.top=data.top_shares||[];model.topLimit=data.top_limit??5;model.health=data.health||{};model.persistence=data.persistence||model.persistence||{};if(apiChanged)model.api=data.api||{};if(walletChanged)model.wallet=data.wallet||{};model.stateAt=Date.now();stateApiChanged=stateApiChanged||apiChanged;stateWalletChanged=stateWalletChanged||walletChanged;scheduleStateRender(immediate);
   }
   function applySnapshot(data) {
-    model.events=data.events||[]; model.lastViewerSeq=data.viewer_seq||0; applyState(data); trimEvents(true); scheduleTimeline(true);
+    const instance=String(((data||{}).health||{}).viewer_instance_id||''),incomingSequence=String(data.viewer_seq||0),rows=Array.isArray(data.events)?data.events:[],previousInstance=model.seenPositions.current_viewer,openIncident=model.incidentTailOrder>0;let gap=snapshotHasSequenceGap(instance,incomingSequence,rows);if(instance&&previousInstance&&instance!==previousInstance&&openIncident){const connects=rows.some(row=>{const [stream,raw]=rowStreamPosition(row),previous=sequenceBigInt(model.seenPositions.streams[stream]),sequence=sequenceBigInt(raw);return stream&&previous!==null&&previous>0n&&sequence===previous+1n;});if(!connects)gap=true;}if(gap)markHistoryGap('Browser history has a reconnect gap; an open error window was stopped instead of counting unrelated later rows');model.viewerInstanceId=instance||model.viewerInstanceId;for(const row of rows){const seen=rowAlreadySeen(row,instance);markEventSeen(row,instance);if(!seen)addBrowserEvent(row);}markViewerSeen(instance,incomingSequence);if(positionsDirty)scheduleStorageFlush();applyState(data,true);pruneBrowserEvents(false);scheduleTimeline(true);
   }
   function applyUpdate(data) {
-    if((data.viewer_seq||0)<=model.lastViewerSeq) return;
-    model.lastViewerSeq=data.viewer_seq; model.events.push(data.row);const size=eventSize(data.row);model.eventSizes.push(size);model.eventBytes+=size;applyState(data);trimEvents(false);
-    if(model.paused){model.pending++; $('pause').textContent=`Resume (${model.pending})`;} else scheduleTimeline(false);
+    const instance=String((((data||{}).health)||{}).viewer_instance_id||model.viewerInstanceId||''),incoming=sequenceBigInt(data.viewer_seq),previous=sequenceBigInt(model.seenPositions.viewers[instance]),row=data.row||{},[stream,rawStreamSequence]=rowStreamPosition(row),streamSequence=sequenceBigInt(rawStreamSequence),previousStream=sequenceBigInt(model.seenPositions.streams[stream]);if(previous!==null&&incoming!==null&&incoming<=previous)return;let gap=previous!==null&&previous>0n&&incoming!==null&&incoming>previous+1n;if(stream&&previousStream!==null&&previousStream>0n&&streamSequence!==null&&streamSequence>previousStream+1n)gap=true;if(instance&&model.seenPositions.current_viewer&&instance!==model.seenPositions.current_viewer&&model.incidentTailOrder>0&&!(stream&&previousStream!==null&&streamSequence===previousStream+1n))gap=true;if(gap)markHistoryGap('Browser history has a live sequence gap; an open error window was stopped instead of counting unrelated later rows');const seen=rowAlreadySeen(row,instance);markEventSeen(row,instance);markViewerSeen(instance,String(data.viewer_seq||0));if(!seen)addBrowserEvent(row);if(positionsDirty)scheduleStorageFlush();applyState(data);pruneBrowserEvents(false);
+    if(model.paused){model.pending++;$('pause').textContent=`Resume (${model.pending})`;}else scheduleTimeline(false);
   }
   function renderHeader() {
     const h=model.health||{}, socket=$('socketBadge'), coverage=$('coverageBadge');
@@ -2908,7 +3309,9 @@ HTML = r'''<!doctype html>
     socket.textContent=`socket: ${h.reader_status||'starting'}`; socket.className=`badge ${socketHealthy?'ok':h.reader_status==='fatal'?'bad':'warn'}`;
     coverage.textContent=h.coverage_complete?'coverage: observed window':'coverage: incomplete'; coverage.className=`badge ${h.coverage_complete?'ok':'warn'}`;
     $('sessionBadge').textContent=`session ${h.session||0}`;
+    renderStorageBadge();
     const api=$('apiBadge'), a=model.api||{}, apiAge=a.last_update_utc?Date.now()-new Date(a.last_update_utc).valueOf():0, apiStale=a.status==='connected'&&apiAge>(Number(a.interval_seconds||5)*2500), apiStatus=apiStale?'stale':(a.status||'disabled'); api.textContent=`API: ${apiStatus}`; api.className=`badge ${apiStatus==='connected'?'ok':apiStatus==='error'?'bad':'warn'}`;
+    const wallet=$('walletBadge'),w=model.wallet||{},walletAge=w.last_update_utc?Date.now()-new Date(w.last_update_utc).valueOf():0,walletStale=w.status==='connected'&&walletAge>(Number(w.interval_seconds||20)*2500),walletStatus=walletStale?'stale':(w.status||'disabled');wallet.textContent=`wallet: ${walletStatus}`;wallet.className=`badge ${walletStatus==='connected'?'ok':walletStatus==='error'?'bad':'warn'}`;
     const persistence=model.persistence||{},db=$('dbBadge'),dbStatus=persistence.enabled===false?'disabled':(persistence.status||'starting');db.textContent=`database: ${dbStatus}`;db.className=`badge ${dbStatus==='ready'?'ok':dbStatus==='error'?'bad':'warn'}`;
     const verifier=(persistence.verifier||{}),verifierStatus=(verifier.status||{}),vb=$('verifierBadge'),verifierHealth=verifierStatus.health||((Number(verifier.results||0)>0)?'observed':'waiting'),verifierGood=['healthy','ready','observed'].includes(verifierHealth);vb.textContent=`verifier: ${verifierHealth}`;vb.className=`badge ${verifierGood?'ok':verifierHealth==='waiting'?'warn':'bad'}`;
     $('readerState').textContent=`${h.reader_message||'—'}\nSocket: ${h.socket_path||'—'}\nStarted: ${time(h.started_utc)}\nLast event: ${time(h.last_event_utc)}`;
@@ -2923,7 +3326,7 @@ HTML = r'''<!doctype html>
   function renderSources() {
     const host=$('sources'); host.replaceChildren(); $('sourceCount').textContent=`${model.sources.length} observed`;
     if(!model.sources.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='Waiting for daemon-backed jobs…';host.appendChild(empty);return;}
-    for(const source of model.sources){const row=document.createElement('div');row.className='source-row'; const elapsed=Date.now()-model.stateAt, ageMs=source.age_ms==null?null:source.age_ms+elapsed, age=ageMs==null?'—':`${(ageMs/1000).toFixed(1)}s`, values=[`S${source.source_id}`,`T${source.template_id||'—'}`,`height ${source.height||'—'} · net ${compact(source.network_target_diff)}`,age,source.status||'observed']; values.forEach((value,index)=>{const span=document.createElement('span');span.textContent=value;if(index===3&&ageMs!==null&&ageMs>45000)span.className='status-error';else if(index===3&&ageMs!==null&&ageMs>30000)span.className='status-warning';if(index===4)span.className=statusClass(source.status);row.appendChild(span);});host.appendChild(row);}
+    for(const source of model.sources){const row=document.createElement('div');row.className='source-row'; const elapsed=Date.now()-model.stateAt, ageMs=source.age_ms==null?null:source.age_ms+elapsed, age=ageMs==null?'—':`${(ageMs/1000).toFixed(1)}s`, values=[`S${source.source_id}`,`T${source.template_id||'—'}`,`height ${source.height||'—'} · net ${compact(source.network_target_diff)}`,age,source.status||'observed']; values.forEach((value,index)=>{const span=document.createElement('span');span.textContent=value;if(index===3&&ageMs!==null)span.className=templateAgeClass(ageMs);if(index===4)span.className=statusClass(source.status);row.appendChild(span);});host.appendChild(row);}
   }
   function renderApiAge() {
     const api=model.api||{}, updateAge=api.last_update_utc?Math.max(0,(Date.now()-new Date(api.last_update_utc).valueOf())/1000):null;
@@ -2937,9 +3340,10 @@ HTML = r'''<!doctype html>
     const body=$('apiWorkersBody');body.replaceChildren();$('apiWorkersEmpty').style.display=workers.length?'none':'block';
     for(const worker of workers){const tr=document.createElement('tr'),rates=worker.hashrate||[];td(tr,worker.name||'—');td(tr,String(worker.connections||0));const one=td(tr,hashrate(rates[0],'kH/s'));one.title=rateTitle(rates[0]);const ten=td(tr,hashrate(rates[1],'kH/s'));ten.title=rateTitle(rates[1]);td(tr,String(worker.accepted||0),statusClass('accepted'));td(tr,String(worker.rejected||0),worker.rejected?'status-rejected':'');td(tr,String(worker.invalid||0),worker.invalid?'status-rejected':'');td(tr,exact(worker.hashes));tr.addEventListener('click',()=>showDetails(worker));body.appendChild(tr);}
   }
+  function renderWallet(){const wallet=model.wallet||{},live=wallet.transfers||[],durable=(model.persistence||{}).wallet_transfers||[],transfers=live.length?live:durable,body=$('walletTransfersBody');$('walletUpdated').textContent=wallet.enabled?`${wallet.message||wallet.status} · ${time(wallet.last_update_utc)}`:'not configured';body.replaceChildren();$('walletTransfersEmpty').style.display=transfers.length?'none':'block';for(const transfer of transfers){const tr=document.createElement('tr'),timestamp=Number(transfer.timestamp||0);td(tr,timestamp?time(new Date(timestamp*1000).toISOString()):'—');td(tr,String(transfer.height||'—'));td(tr,xmrAmount(transfer.amount_atomic));td(tr,nf.format(Number(transfer.confirmations||0)));td(tr,transfer.locked?'locked':'unlocked',transfer.locked?'status-warning':'status-accepted');td(tr,`${transfer.account_index??0} / ${transfer.subaddress_index??0}`);const txid=td(tr,short(transfer.txid));txid.title=transfer.txid||'';tr.addEventListener('click',()=>showDetails(transfer));body.appendChild(tr);}}
   function renderTop() {
     const body=$('topBody'); body.replaceChildren(); $('topEmpty').style.display=model.top.length?'none':'block';
-    model.top.forEach((share,index)=>{const tr=document.createElement('tr');td(tr,String(index+1));td(tr,time(share.time_utc));const d=td(tr,exact(share.share_diff));d.title=`Reported difficulty ${share.share_diff}`;td(tr,share.miner_id?`m${share.miner_id}${share.mapper_id?`/p${share.mapper_id}`:''}`:'—');td(tr,share.worker||'—');td(tr,share.height||'—');td(tr,share.status==='accepted_upstream'?'upstream':'local',statusClass(share.status));tr.addEventListener('click',()=>showDetails(share));body.appendChild(tr);});
+    model.top.forEach((share,index)=>{const tr=document.createElement('tr');td(tr,String(index+1));td(tr,time(share.time_utc));const d=td(tr,exact(share.share_diff));d.title=`Reported difficulty ${share.share_diff}`;td(tr,share.miner_label||'—');td(tr,share.worker||'—');td(tr,share.height||'—');td(tr,share.status==='accepted_upstream'?'upstream':'local',statusClass(share.status));tr.addEventListener('click',()=>showDetails(share));body.appendChild(tr);});
   }
   function renderPersistence() {
     const p=model.persistence||{},r=p.current_round||{},c=p.cumulative||{},rounds=p.recent_rounds||[],blocks=p.recent_blocks||[],big=p.big_shares||[];
@@ -2961,37 +3365,58 @@ HTML = r'''<!doctype html>
   async function loadRound(id){try{const response=await fetch(`/api/round?id=${encodeURIComponent(id)}`,{headers:{Accept:'application/json'}});const value=await response.json();if(!response.ok)throw new Error(value.error||`HTTP ${response.status}`);renderRoundDetail(value);}catch(error){showDetails({error:String(error),round_id:id});}}
   async function loadShare(key){try{const response=await fetch(`/api/share?key=${encodeURIComponent(key)}`,{headers:{Accept:'application/json'}});const value=await response.json();if(!response.ok)throw new Error(value.error||`HTTP ${response.status}`);showDetails(value);}catch(error){showDetails({error:String(error),share_event_key:key});}}
   function filteredEvents() {
-    const category=$('category').value, query=$('search').value.trim().toLowerCase(); let values=model.events;
-    if(category!=='all'){const fn=groups[category];values=values.filter(row=>fn(row.event||'',row));}
-    if(query) values=values.filter(row=>JSON.stringify(row).toLowerCase().includes(query));
-    return values.slice(-1000);
+    const category=$('category').value;
+    return newestMatchingEvents(model.events,{categoryFn:category==='all'?null:groups[category],query:$('search').value,connectionUuid:model.traceConnectionUuid,minimumDifficulty:model.minShareDiff});
+  }
+  function updateSelectionControls(values=filteredEvents()) {
+    const selectedCount=model.selectedEventKeys.size,visibleKeys=values.map(eventKey).filter(Boolean),visibleSelected=visibleKeys.filter(key=>model.selectedEventKeys.has(key)).length,selectVisible=$('selectVisible');
+    $('copySelected').textContent=`Copy selected JSON (${selectedCount})`;$('copySelected').disabled=!selectedCount;$('clearSelected').disabled=!selectedCount;
+    selectVisible.disabled=!visibleKeys.length;selectVisible.checked=visibleKeys.length>0&&visibleSelected===visibleKeys.length;selectVisible.indeterminate=visibleSelected>0&&visibleSelected<visibleKeys.length;
   }
   let scheduled=false, forceFollow=false;
   function scheduleTimeline(force){forceFollow=forceFollow||force;if(scheduled)return;scheduled=true;setTimeout(()=>{scheduled=false;renderTimeline(forceFollow);forceFollow=false;},100);}
   function renderTimeline(force) {
     const values=filteredEvents(),body=$('eventsBody'),scroller=$('eventsScroll');body.replaceChildren();
-    for(const row of values){const tr=document.createElement('tr');td(tr,time(row.time_utc));td(tr,row.event||'—',eventClass(row.event||''));td(tr,row.miner_id?`m${row.miner_id}${row.mapper_id?`/p${row.mapper_id}`:''}${row.worker?` · ${row.worker}`:''}`:'—');td(tr,row.source_id?`S${row.source_id}${row.template_id?`:T${row.template_id}`:''}`:'—');td(tr,row.height||'—');const diff=td(tr,compact(row.share_diff));if(row.share_diff)diff.title=exact(row.share_diff);td(tr,row.status||'—',statusClass(row.status));td(tr,detailText(row));tr.addEventListener('click',()=>showDetails(row));body.appendChild(tr);}
-    $('eventCount').textContent=`${values.length} shown · ${model.events.length} buffered`;
+    for(const row of values){const tr=document.createElement('tr'),key=eventKey(row),selected=key&&model.selectedEventKeys.has(key),archived=key&&model.protectedEventKeys.has(key);if(archived)tr.classList.add('event-archived');if(selected)tr.classList.add('event-selected');const selectCell=td(tr,'','selection-cell'),checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.className='row-select';checkbox.checked=selected;checkbox.disabled=!key;checkbox.setAttribute('aria-label',`Select event ${row.event_seq||key||''}`);checkbox.addEventListener('click',event=>event.stopPropagation());checkbox.addEventListener('change',()=>{updateSelections([key],checkbox.checked);tr.classList.toggle('event-selected',checkbox.checked);updateSelectionControls(values);renderStorageBadge();});selectCell.appendChild(checkbox);td(tr,time(row.time_utc));td(tr,row.event||'—',eventClass(row.event||''));const connection=td(tr,short(row.connection_uuid));connection.title=row.connection_uuid||'';td(tr,row.miner_label?`${row.miner_label}${row.worker?` · ${row.worker}`:''}`:'—');td(tr,row.source_id?`S${row.source_id}${row.template_id?`:T${row.template_id}`:''}`:'—');td(tr,row.height||'—');const diff=td(tr,compact(row.share_diff));if(row.share_diff)diff.title=exact(row.share_diff);td(tr,row.status||'—',statusClass(row.status));td(tr,detailText(row));tr.addEventListener('click',()=>showDetails(row));body.appendChild(tr);}
+    $('eventCount').textContent=`${values.length} shown · ${model.events.length} stored · ${model.protectedEventKeys.size} error-archive rows`;
+    renderStorageBadge();
+    updateSelectionControls(values);
     if((force||$('follow').checked)&&!model.paused) scroller.scrollTop=scroller.scrollHeight;
   }
-  function showDetails(value){model.detailsText=JSON.stringify(jsonReady(value),null,2);$('details').innerHTML=jsonHtml(value);$('copyState').textContent='';}
+  function renderTraceControls(){const value=model.detailValue,candidate=value&&typeof value==='object'?String(value.connection_uuid||''):'',active=model.traceConnectionUuid;$('followConnection').disabled=!candidate;$('followConnection').textContent=candidate&&candidate===active?'Following connection':'Follow connection';$('traceState').hidden=!active;$('traceState').textContent=active?`trace: ${model.traceConnectionLabel||short(active)}`:'';$('traceState').title=active;$('clearTrace').disabled=!active;}
+  function showDetails(value){model.detailValue=value&&typeof value==='object'?value:null;model.detailsText=jsonText(value);$('details').innerHTML=jsonHtml(value);$('copyState').textContent='';renderTraceControls();}
+  function followSelectedConnection(){const row=model.detailValue,connection=String((row||{}).connection_uuid||'');if(!connection)return;model.traceConnectionUuid=connection;model.traceConnectionLabel=String(row.miner_label||short(connection));renderTraceControls();scheduleTimeline(true);}
+  function clearConnectionTrace(){model.traceConnectionUuid='';model.traceConnectionLabel='';renderTraceControls();scheduleTimeline(false);}
+  function updateMinimumDifficulty(){const input=$('minShareDiff'),parsed=parseMinimumDifficulty(input.value),invalid=parsed===undefined;input.setCustomValidity(invalid?'Enter a non-negative whole number.':'');input.setAttribute('aria-invalid',String(invalid));$('minDiffState').textContent=invalid?'whole numbers only':'';model.minShareDiff=invalid?null:parsed;scheduleTimeline(false);}
+  async function clearBrowserRows(kind){const archive=kind==='errors',rows=model.events.filter(row=>archive?model.protectedEventKeys.has(eventKey(row)):!model.protectedEventKeys.has(eventKey(row))),keys=rows.map(eventKey).filter(Boolean);extendClearWatermarks(model.events);if(archive){model.incidentTailOrder=0;model.incidentIncomplete=false;incidentStateDirty=true;}removeEventKeys(keys,{persist:false});await clearStoredHistory(keys);scheduleTimeline(false);}
+  async function copyText(value){try{await navigator.clipboard.writeText(value);return;}catch(_){const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();document.execCommand('copy');area.remove();}}
 
-  $('category').addEventListener('change',()=>scheduleTimeline(false)); $('search').addEventListener('input',()=>scheduleTimeline(false));
+  $('category').addEventListener('change',()=>scheduleTimeline(false)); $('search').addEventListener('input',()=>scheduleTimeline(false));$('minShareDiff').addEventListener('input',updateMinimumDifficulty);
   $('pause').addEventListener('click',()=>{model.paused=!model.paused;if(model.paused){$('pause').textContent='Resume';}else{model.pending=0;$('pause').textContent='Pause view';scheduleTimeline(true);}});
-  $('clear').addEventListener('click',()=>{model.events=[];model.eventSizes=[];model.eventBytes=0;scheduleTimeline(false);}); $('closeDetails').addEventListener('click',()=>{model.detailsText='';$('details').textContent='Select a timeline, share, block, seed, worker, or round row to inspect every field.';$('copyState').textContent='';});
-  $('copyDetails').addEventListener('click',async()=>{if(!model.detailsText){$('copyState').textContent='nothing selected';return;}try{await navigator.clipboard.writeText(model.detailsText);$('copyState').textContent='copied';}catch(_){const area=document.createElement('textarea');area.value=model.detailsText;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();document.execCommand('copy');area.remove();$('copyState').textContent='copied';}setTimeout(()=>{$('copyState').textContent='';},1500);});
+  $('clear').addEventListener('click',async()=>{if(window.confirm('Clear ordinary browser history and its selections? The Errors archive will remain.'))await clearBrowserRows('normal');});
+  $('clearErrors').addEventListener('click',async()=>{if(window.confirm('Permanently clear all archived error incidents, their 100-row context windows, and any selections on those rows?'))await clearBrowserRows('errors');});
+  $('closeDetails').addEventListener('click',()=>{model.detailValue=null;model.detailsText='';$('details').textContent='Select a timeline, share, block, seed, worker, or round row to inspect every field.';$('copyState').textContent='';renderTraceControls();});
+  $('followConnection').addEventListener('click',followSelectedConnection);$('clearTrace').addEventListener('click',clearConnectionTrace);
+  $('selectVisible').addEventListener('change',event=>{updateSelections(filteredEvents().map(eventKey),event.currentTarget.checked);scheduleTimeline(false);});
+  $('clearSelected').addEventListener('click',()=>{updateSelections([...model.selectedEventKeys],false);$('selectionState').textContent='';scheduleTimeline(false);});
+  $('copySelected').addEventListener('click',async()=>{const rows=selectedRows(model.events,model.selectedEventKeys);if(!rows.length){$('selectionState').textContent='nothing selected';return;}await copyText(selectedJson(model.events,model.selectedEventKeys));$('selectionState').textContent=`copied ${rows.length} rows`;setTimeout(()=>{$('selectionState').textContent='';},1500);});
+  $('copyDetails').addEventListener('click',async()=>{if(!model.detailsText){$('copyState').textContent='nothing selected';return;}await copyText(model.detailsText);$('copyState').textContent='copied';setTimeout(()=>{$('copyState').textContent='';},1500);});
   $('inspectVerifier').addEventListener('click',()=>showDetails((model.persistence||{}).verifier||{}));
   $('closeRound').addEventListener('click',()=>{$('selectedRoundPanel').style.display='none';$('selectedRoundShares').replaceChildren();});
   const loadRoundLookup=()=>{const value=$('roundLookup').value.trim();if(!/^\d+$/.test(value)||value==='0'){showDetails({error:'Enter a positive round ID.'});return;}loadRound(value);};
   $('loadRoundButton').addEventListener('click',loadRoundLookup);
   $('roundLookup').addEventListener('keydown',event=>{if(event.key==='Enter')loadRoundLookup();});
 
-  const stream=new EventSource('/api/stream');
-  stream.onopen=()=>{const badge=$('browserBadge');badge.textContent='dashboard: live';badge.className='badge ok';};
-  stream.addEventListener('snapshot',event=>applySnapshot(JSON.parse(event.data)));
-  stream.addEventListener('update',event=>applyUpdate(JSON.parse(event.data)));
-  stream.addEventListener('state',event=>applyState(JSON.parse(event.data)));
-  stream.onerror=()=>{const badge=$('browserBadge');badge.textContent='dashboard: reconnecting';badge.className='badge warn';};
+  let startupReady=false,startupMessages=[];
+  function dispatchStreamMessage(kind,data){if(kind==='snapshot')applySnapshot(data);else if(kind==='update')applyUpdate(data);else applyState(data);}
+  function drainStreamMessages(){if(!startupReady||model.storageSuspended)return;const messages=startupMessages;startupMessages=[];for(const [kind,data] of messages)dispatchStreamMessage(kind,data);}
+  function receiveStreamMessage(kind,event){const data=JSON.parse(event.data);if(!startupReady||model.storageSuspended)startupMessages.push([kind,data]);else dispatchStreamMessage(kind,data);}
+  async function startDashboard(){const stream=new EventSource('/api/stream');stream.onopen=()=>{const badge=$('browserBadge');badge.textContent='dashboard: live';badge.className='badge ok';};stream.addEventListener('snapshot',event=>receiveStreamMessage('snapshot',event));stream.addEventListener('update',event=>receiveStreamMessage('update',event));stream.addEventListener('state',event=>receiveStreamMessage('state',event));stream.onerror=()=>{const badge=$('browserBadge');badge.textContent='dashboard: reconnecting';badge.className='badge warn';};await restoreBrowserHistory();startupReady=true;drainStreamMessages();}
+  function suspendBrowserStorage(){if(!model.browserDb||model.browserStorageStatus!=='ready')return;model.storageSuspended=true;if(storageLeaseTimer!==null){clearInterval(storageLeaseTimer);storageLeaseTimer=null;}if(storageFlushTimer!==null){clearTimeout(storageFlushTimer);storageFlushTimer=null;}flushBrowserStorage();releaseBrowserLease().catch(()=>{});setBrowserStorageStatus('opening','Browser history is suspended until this page regains its fenced writer lease');}
+  async function resumeBrowserStorage(){if(!model.browserDb||model.browserStorageStatus==='error'){model.storageSuspended=false;drainStreamMessages();return;}try{await acquireBrowserLease(model.browserDb);setBrowserStorageStatus('ready',`IndexedDB keeps about ${nf.format(BROWSER_EVENT_LIMIT)} ordinary rows or ${compact(model.maxEventBytes)}B; selections and 201-row error windows are pinned`);storageLeaseTimer=setInterval(heartbeatBrowserLease,STORAGE_LEASE_HEARTBEAT_MS);model.storageSuspended=false;drainStreamMessages();if(pendingEventWrites.size||pendingEventDeletes.size||pendingSelectionWrites.size||positionsDirty||incidentStateDirty)scheduleStorageFlush(0);}catch(error){storageFailed(error);model.storageSuspended=false;drainStreamMessages();}}
+  window.addEventListener('pagehide',suspendBrowserStorage);
+  window.addEventListener('pageshow',event=>{if(event.persisted)resumeBrowserStorage();});
+  startDashboard();
   setInterval(()=>{renderHeader();renderSources();renderApiAge();},1000);
 })();
 </script>
@@ -3199,6 +3624,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-token-env", default="XMRIG_PROXY_API_TOKEN", metavar="NAME", help="environment variable holding the API token (default: XMRIG_PROXY_API_TOKEN)")
     parser.add_argument("--api-token-file", metavar="FILE", help="alternative mode-0600 file containing the API token")
     parser.add_argument("--api-interval", type=float, default=5.0, metavar="SECONDS", help="API polling interval (default: 5; minimum: 1)")
+    parser.add_argument("--wallet-rpc-url", metavar="URL", help="optional loopback monero-wallet-rpc endpoint, for example http://127.0.0.1:18082/json_rpc")
+    parser.add_argument("--wallet-rpc-login", metavar="USER:PASS", help="Digest-auth login for --wallet-rpc-url")
+    parser.add_argument("--wallet-rpc-interval", type=float, default=DEFAULT_WALLET_RPC_INTERVAL, metavar="SECONDS", help="wallet RPC polling interval (default: 20; minimum: 5)")
     parser.add_argument("--database", default=DEFAULT_DATABASE, metavar="FILE", help=f"persistent SQLite database (default: {DEFAULT_DATABASE})")
     parser.add_argument("--no-database", action="store_true", help="disable persistence and round history")
     parser.add_argument("--big-share-diff", type=int, default=DEFAULT_BIG_SHARE_DIFFICULTY, metavar="DIFF", help=f"persist every share at or above this difficulty (default: {DEFAULT_BIG_SHARE_DIFFICULTY})")
@@ -3221,6 +3649,36 @@ def normalize_api_url(value: str) -> str:
     except ValueError as exc:
         raise ValueError(f"invalid --api-url port: {exc}") from exc
     return value.rstrip("/")
+
+
+def normalize_wallet_rpc_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("--wallet-rpc-url must use http or https")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "--wallet-rpc-url cannot contain credentials, a query, or a fragment"
+        )
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("--wallet-rpc-url must use a loopback host")
+    if parsed.path not in {"", "/", "/json_rpc"}:
+        raise ValueError("--wallet-rpc-url path must be /json_rpc")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid --wallet-rpc-url port: {exc}") from exc
+    return f"{parsed.scheme}://{parsed.netloc}/json_rpc"
+
+
+def parse_wallet_rpc_login(value: str) -> Tuple[str, str]:
+    if ":" not in value:
+        raise ValueError("--wallet-rpc-login must use USER:PASS")
+    username, password = value.split(":", 1)
+    if not username or not password:
+        raise ValueError("--wallet-rpc-login requires a non-empty user and password")
+    if len(value) > 4096 or any(ord(char) < 0x20 for char in value):
+        raise ValueError("--wallet-rpc-login contains invalid characters")
+    return username, password
 
 
 def load_api_token(args: argparse.Namespace) -> str:
@@ -3270,6 +3728,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--api-interval must be a finite number between 1 and 60 seconds")
     if args.api_token_file and not args.api_url:
         raise ValueError("--api-token-file requires --api-url")
+    if bool(args.wallet_rpc_url) != bool(args.wallet_rpc_login):
+        raise ValueError("--wallet-rpc-url and --wallet-rpc-login must be supplied together")
+    if not math.isfinite(args.wallet_rpc_interval) or not 5.0 <= args.wallet_rpc_interval <= 3600.0:
+        raise ValueError("--wallet-rpc-interval must be a finite number between 5 and 3600 seconds")
     if not 1 <= args.big_share_diff <= (1 << 64) - 1:
         raise ValueError("--big-share-diff must be between 1 and UINT64_MAX")
     if not 1 <= args.round_top_shares <= 10000:
@@ -3282,6 +3744,8 @@ def run(args: argparse.Namespace) -> int:
     validate_args(args)
     api_url = normalize_api_url(args.api_url) if args.api_url else ""
     api_token = load_api_token(args) if api_url else ""
+    wallet_url = normalize_wallet_rpc_url(args.wallet_rpc_url) if args.wallet_rpc_url else ""
+    wallet_login = parse_wallet_rpc_login(args.wallet_rpc_login) if wallet_url else ("", "")
     stop_event = threading.Event()
     store = None if args.no_database else SQLiteStore(
         args.database, args.big_share_diff, args.round_top_shares,
@@ -3289,10 +3753,15 @@ def run(args: argparse.Namespace) -> int:
     state = DashboardState(
         args.socket, args.max_events, args.top_shares,
         api_enabled=bool(api_url), api_interval=args.api_interval,
+        wallet_enabled=bool(wallet_url), wallet_interval=args.wallet_rpc_interval,
         store=store,
     )
     reader = UnixEventReader(args.socket, state, stop_event, args.retry_cap)
     api_poller = ApiPoller(api_url, api_token, args.api_interval, state, stop_event) if api_url else None
+    wallet_poller = WalletRpcPoller(
+        wallet_url, wallet_login[0], wallet_login[1],
+        args.wallet_rpc_interval, state, stop_event,
+    ) if wallet_url else None
     server = DashboardHTTPServer(("127.0.0.1", args.port), state)
 
     print(f"XMRig event dashboard: http://127.0.0.1:{args.port}/", flush=True)
@@ -3301,6 +3770,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"Persisting statistics: {store.path}", flush=True)
     if api_url:
         print(f"Polling proxy API: {api_url} every {args.api_interval:g}s", flush=True)
+    if wallet_url:
+        print(f"Polling wallet RPC: {wallet_url} every {args.wallet_rpc_interval:g}s", flush=True)
     print("The HTTP listener is restricted to 127.0.0.1.", flush=True)
 
     if store is not None:
@@ -3308,6 +3779,8 @@ def run(args: argparse.Namespace) -> int:
     reader.start()
     if api_poller:
         api_poller.start()
+    if wallet_poller:
+        wallet_poller.start()
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
@@ -3320,6 +3793,8 @@ def run(args: argparse.Namespace) -> int:
         reader.join(timeout=3.0)
         if api_poller:
             api_poller.join(timeout=3.0)
+        if wallet_poller:
+            wallet_poller.join(timeout=3.0)
         state.shutdown()
         if store is not None:
             store.close()

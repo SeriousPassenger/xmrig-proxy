@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -155,6 +156,14 @@ class StateTest(unittest.TestCase):
         state.begin_session()
         self.assertTrue(state.health()["coverage_complete"])
 
+    def test_viewer_instance_id_is_stable_and_process_scoped(self):
+        first = events.DashboardState("/tmp/events.sock", 100, 5)
+        second = events.DashboardState("/tmp/events.sock", 100, 5)
+        first_id = first.health()["viewer_instance_id"]
+        self.assertRegex(first_id, r"^[0-9a-f]{32}$")
+        self.assertEqual(first.snapshot()["health"]["viewer_instance_id"], first_id)
+        self.assertNotEqual(second.health()["viewer_instance_id"], first_id)
+
     def test_no_database_state_is_explicitly_disabled(self):
         state = events.DashboardState("/tmp/events.sock", 100, 5)
         persistence = state.snapshot()["persistence"]
@@ -184,6 +193,7 @@ class StateTest(unittest.TestCase):
         self.assertEqual([int(item["share_diff"]) for item in top], [70, 60, 50, 30, 20])
         self.assertEqual(top[0]["time_utc"], "2026-08-08T00:00:04.000Z")
         self.assertEqual(top[0]["miner_id"], "2")
+        self.assertEqual(events.uuid.UUID(top[0]["connection_uuid"]).version, 5)
         self.assertNotIn("_difficulty", top[0])
 
     def test_reused_share_id_after_reconnect_is_distinct(self):
@@ -208,6 +218,92 @@ class StateTest(unittest.TestCase):
         ))
         last = state.snapshot()["events"][-1]
         self.assertEqual((last["miner_id"], last["mapper_id"], last["worker"]), ("7", "3", "rental-a"))
+        self.assertEqual(last["miner_label"], "m7/p3")
+        self.assertEqual(
+            last["connection_uuid"],
+            state.snapshot()["events"][-2]["connection_uuid"],
+        )
+
+    def test_v3_connection_uuid_is_stable_and_connection_scoped(self):
+        state = self.state()
+        stream_a = "a" * 32
+        stream_b = "b" * 32
+        state.ingest(row(
+            schema_version=3, stream_id=stream_a, event="worker_connected",
+            event_seq=1, miner_id=7,
+        ))
+        state.ingest(row(
+            schema_version=3, stream_id=stream_a, event="job_sent",
+            event_seq=2, miner_id=7, mapper_id=23,
+        ))
+        state.ingest(row(
+            schema_version=3, stream_id=stream_a, event="job_sent",
+            event_seq=3, miner_id=7, mapper_id=24,
+        ))
+        state.ingest(row(
+            schema_version=3, stream_id=stream_a, event="worker_connected",
+            event_seq=4, miner_id=8, mapper_id=23,
+        ))
+        observed = [item for item in state.snapshot()["events"] if item.get("miner_id")]
+        first = observed[0]["connection_uuid"]
+        self.assertEqual(first, observed[1]["connection_uuid"])
+        self.assertEqual(first, observed[2]["connection_uuid"])
+        self.assertNotEqual(first, observed[3]["connection_uuid"])
+        self.assertEqual(
+            [item["miner_label"] for item in observed],
+            ["m7", "m7/p23", "m7/p24", "m8/p23"],
+        )
+        self.assertEqual(events.uuid.UUID(first).version, 5)
+
+        restarted_dashboard = self.state()
+        restarted_dashboard.ingest(row(
+            schema_version=3, stream_id=stream_a, event="job_sent",
+            event_seq=1, miner_id=7,
+        ))
+        self.assertEqual(
+            restarted_dashboard.snapshot()["events"][-1]["connection_uuid"],
+            first,
+        )
+
+        state.end_session("test reconnect")
+        state.begin_session()
+        state.ingest(row(
+            schema_version=3, stream_id=stream_a, event="job_sent",
+            event_seq=5, miner_id=7,
+        ))
+        self.assertEqual(state.snapshot()["events"][-1]["connection_uuid"], first)
+
+        state.end_session("proxy restart")
+        state.begin_session()
+        state.ingest(row(
+            schema_version=3, stream_id=stream_b, event="worker_connected",
+            event_seq=1, miner_id=7,
+        ))
+        self.assertNotEqual(state.snapshot()["events"][-1]["connection_uuid"], first)
+
+    def test_v2_connection_uuid_is_limited_to_observed_session(self):
+        state = self.state()
+        state.ingest(row(event="worker_connected", event_seq=1, miner_id=7))
+        first = state.snapshot()["events"][-1]["connection_uuid"]
+        state.ingest(row(event="job_sent", event_seq=2, miner_id=7))
+        self.assertEqual(state.snapshot()["events"][-1]["connection_uuid"], first)
+
+        state.end_session("legacy reconnect")
+        state.begin_session()
+        state.ingest(row(event="worker_connected", event_seq=1, miner_id=7))
+        self.assertNotEqual(state.snapshot()["events"][-1]["connection_uuid"], first)
+
+    def test_searchable_miner_label_preserves_mapper_zero(self):
+        state = self.state()
+        state.ingest(row(
+            schema_version=3, stream_id="a" * 32,
+            event="job_sent", event_seq=1, miner_id=13, mapper_id=0,
+        ))
+        observed = state.snapshot()["events"][-1]
+        self.assertEqual(observed["miner_label"], "m13/p0")
+        self.assertIn('"miner_label":"m13/p0"', events.json.dumps(
+            observed, separators=(",", ":"),
+        ))
 
     def test_ring_is_bounded(self):
         state = self.state(max_events=3)
@@ -299,6 +395,7 @@ class StateTest(unittest.TestCase):
         update = subscriber.get_nowait()
         self.assertEqual(update["kind"], "update")
         self.assertNotIn("api", update)
+        self.assertNotIn("wallet", update)
         state.unsubscribe(subscriber)
 
 
@@ -1221,6 +1318,127 @@ class ApiTest(unittest.TestCase):
                 events.load_api_token(args)
 
 
+class WalletRpcTest(unittest.TestCase):
+    TXID = "ab" * 32
+
+    @classmethod
+    def response(cls, **updates):
+        value = {
+            "txid": cls.TXID,
+            "type": "block",
+            "amount": 600_000_000_000,
+            "height": 3_200_000,
+            "timestamp": 1_723_075_200,
+            "confirmations": 12,
+            "unlock_time": 3_200_060,
+            "locked": True,
+            "subaddr_index": {"major": 1, "minor": 2},
+        }
+        value.update(updates)
+        return value
+
+    def test_only_coinbase_rewards_are_allowlisted(self):
+        transfers = events.sanitize_wallet_transfers({
+            "in": [
+                self.response(secret="must-not-leak"),
+                self.response(txid="cd" * 32, type="in", amount=123),
+                self.response(txid="ef" * 32, amount=-1),
+            ],
+            "out": [self.response(txid="01" * 32)],
+            "password": "must-not-leak",
+        })
+        self.assertEqual(len(transfers), 1)
+        self.assertEqual(transfers[0]["txid"], self.TXID)
+        self.assertEqual(transfers[0]["type"], "block")
+        self.assertEqual(transfers[0]["amount_atomic"], "600000000000")
+        self.assertEqual(transfers[0]["account_index"], 1)
+        self.assertNotIn("must-not-leak", events.json.dumps(transfers))
+
+    def test_wallet_transfers_upsert_into_sqlite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = events.SQLiteStore(str(Path(directory) / "events.sqlite3"))
+            store.start()
+            first = events.sanitize_wallet_transfers({"in": [self.response()]})
+            updated = events.sanitize_wallet_transfers({
+                "in": [self.response(confirmations=13, locked=False)],
+            })
+            store.enqueue_wallet_transfers(first)
+            store.enqueue_wallet_transfers(updated)
+            store.close()
+            retained = store.snapshot()["wallet_transfers"]
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0]["confirmations"], 13)
+            self.assertFalse(retained[0]["locked"])
+            db = store._read_connect()
+            try:
+                self.assertEqual(
+                    db.execute("SELECT count(*) FROM wallet_transfers").fetchone()[0], 1,
+                )
+            finally:
+                db.close()
+
+    def test_wallet_url_login_and_default_interval_are_optional(self):
+        parser = events.build_parser()
+        disabled = parser.parse_args([])
+        self.assertIsNone(disabled.wallet_rpc_url)
+        self.assertIsNone(disabled.wallet_rpc_login)
+        self.assertEqual(disabled.wallet_rpc_interval, 20.0)
+        self.assertEqual(
+            events.normalize_wallet_rpc_url("http://127.0.0.1:18082"),
+            "http://127.0.0.1:18082/json_rpc",
+        )
+        self.assertEqual(events.parse_wallet_rpc_login("user:pass:with:colons"), (
+            "user", "pass:with:colons",
+        ))
+        with self.assertRaises(ValueError):
+            events.normalize_wallet_rpc_url("http://example.com:18082/json_rpc")
+        with self.assertRaises(ValueError):
+            events.parse_wallet_rpc_login("missing-colon")
+
+    def test_every_rpc_call_builds_fresh_digest_auth_and_closes_connection(self):
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read(_limit):
+                return b'{"jsonrpc":"2.0","id":"dashboard","result":{"in":[]}}'
+
+        class Opener:
+            @staticmethod
+            def open(request, timeout):
+                requests.append((request, timeout))
+                return Response()
+
+        state = events.DashboardState(
+            "/tmp/events.sock", 100, 5, wallet_enabled=True,
+        )
+        poller = events.WalletRpcPoller(
+            "http://127.0.0.1:18082/json_rpc", "user", "pass", 20,
+            state, threading.Event(),
+        )
+        with mock.patch.object(events, "build_opener", side_effect=lambda *handlers: Opener()) as build:
+            poller._call("get_transfers", {"in": True})
+            poller._call("get_transfers", {"in": True})
+        self.assertEqual(build.call_count, 2)
+        for call in build.call_args_list:
+            self.assertTrue(any(
+                isinstance(handler, events.HTTPDigestAuthHandler)
+                for handler in call.args
+            ))
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(
+            request.get_header("Connection") == "close" for request, _ in requests
+        ))
+
+
 class PageTest(unittest.TestCase):
     def setUp(self):
         self.state = events.DashboardState("/tmp/events.sock", 100, 5)
@@ -1249,6 +1467,10 @@ class PageTest(unittest.TestCase):
             "Top 5 observed accepted shares", "Live event timeline",
             "XMRig Proxy HTTP API", "apiWorkersBody", "Hashrate 1m",
             "Persistent mining rounds", "RandomX verifier", "Copy JSON",
+            "Copy selected JSON (0)", "Connection UUID", "selectVisible",
+            "historyBadge", "BROWSER_EVENT_LIMIT = 50000", "indexedDB.open",
+            "Errors archive", "Minimum share difficulty", "Follow connection",
+            "Monero mining wallet rewards", "walletTransfersBody",
             "Validated daemon-solo payout destinations",
             "Load any past round ID",
         ):
@@ -1326,6 +1548,20 @@ class PageTest(unittest.TestCase):
         self.assertIn("123", output)
 
     @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_template_age_matches_forty_second_poll_interval(self):
+        helper = re.search(r"  const templateAgeClass = (.*?);\n", events.HTML)
+        self.assertIsNotNone(helper)
+        script = (
+            "const templateAgeClass = " + helper.group(1) + ";\n"
+            "console.log(JSON.stringify([39999,40000,40001,80000,80001].map(templateAgeClass)));\n"
+        )
+        output = events.json.loads(subprocess.check_output(["node", "-e", script], text=True))
+        self.assertEqual(output, [
+            "status-healthy", "status-healthy", "status-warning",
+            "status-warning", "status-error",
+        ])
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
     def test_hashrate_formatter_auto_scales_and_rejects_unknown_values(self):
         missing = re.search(r"  const missing = (.*?);\n", events.HTML)
         helper = re.search(r"  const hashrate = (.+);\n", events.HTML)
@@ -1361,6 +1597,337 @@ class PageTest(unittest.TestCase):
         self.assertIn('class="json-string"', output)
         self.assertNotIn("<script>", output)
         self.assertIn("&lt;script&gt;", output)
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_selected_event_rows_serialize_as_ordered_json_array(self):
+        block = re.search(
+            r"  const jsonReady = (.*?);\n  const escapeHtml =",
+            events.HTML,
+            re.S,
+        )
+        self.assertIsNotNone(block)
+        script = "const missing = value => value === null || value === undefined || value === '';\n"
+        script += "const model = {viewerInstanceId:'test-viewer'};\n"
+        script += "const jsonReady = " + block.group(1) + ";\n"
+        script += """
+const rows = [
+  {_viewer_seq: 1, event: 'first', connection_uuid: '11111111-2222-5333-8444-555555555555', miner_label: 'm13/p23', verifier_stats_json: '{"active":1}'},
+  {_viewer_seq: 2, event: 'middle'},
+  {_viewer_seq: 3, event: 'last'}
+];
+console.log(selectedJson(rows, new Set(['viewer:test-viewer:3', 'viewer:test-viewer:1'])));
+console.error(jsonText(rows[0]));
+"""
+        result = subprocess.run(
+            ["node", "-e", script], text=True, check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        selected = events.json.loads(result.stdout)
+        single = events.json.loads(result.stderr)
+        self.assertIsInstance(selected, list)
+        self.assertEqual([item["event"] for item in selected], ["first", "last"])
+        self.assertEqual(selected[0]["verifier_stats_json"], {"active": 1})
+        self.assertEqual(selected[0]["miner_label"], "m13/p23")
+        self.assertEqual(selected[0]["connection_uuid"], "11111111-2222-5333-8444-555555555555")
+        self.assertIsInstance(single, dict)
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_browser_event_keys_and_pruning_keep_selected_rows(self):
+        helpers = {}
+        for name in ("deriveEventKey", "attachEventMeta", "eventKey", "oldestUnselectedKeys"):
+            match = re.search(rf"  const {name} = (.*?);\n", events.HTML)
+            self.assertIsNotNone(match)
+            helpers[name] = match.group(1)
+        script = "const missing = value => value === null || value === undefined || value === '';\n"
+        script += "const model = {viewerInstanceId:'viewer-a'};\n"
+        script += "const utf8Encoder = new TextEncoder();\n"
+        script += "\n".join(f"const {name} = {value};" for name, value in helpers.items())
+        script += r'''
+const stream = 'a'.repeat(32);
+const first = {_viewer_seq:1,event_seq:'7',stream_id:stream,event:'one'};
+const second = {_viewer_seq:2,event_seq:'8',stream_id:stream,event:'two'};
+const legacy = {_viewer_seq:3,event_seq:'9',event:'legacy'};
+attachEventMeta(first,deriveEventKey(first,'viewer-a'),1);
+attachEventMeta(second,deriveEventKey(second,'viewer-a'),2);
+attachEventMeta(legacy,deriveEventKey(legacy,'viewer-a'),3);
+console.log(JSON.stringify({
+  streamKey:eventKey(first),
+  legacyKey:eventKey(legacy),
+  restartedLegacyKey:deriveEventKey(legacy,'viewer-b'),
+  prune:oldestUnselectedKeys([first,second,legacy],new Set([eventKey(first)]),new Set(),2),
+  copied:JSON.stringify(first)
+}));
+'''
+        output = events.json.loads(subprocess.check_output(["node", "-e", script], text=True))
+        self.assertEqual(output["streamKey"], f"stream:{'a' * 32}:7")
+        self.assertEqual(output["legacyKey"], "viewer:viewer-a:3")
+        self.assertEqual(output["restartedLegacyKey"], "viewer:viewer-b:3")
+        self.assertEqual(output["prune"], [f"stream:{'a' * 32}:8", "viewer:viewer-a:3"])
+        self.assertNotIn("__event_", output["copied"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_error_archive_classifier_and_context_boundaries(self):
+        names = (
+            "normalizedText", "incidentKind", "isIncidentTrigger",
+            "incidentPriorRows", "incidentTailEnd",
+        )
+        helpers = {}
+        for name in names:
+            match = re.search(rf"  const {name} = (.*?);\n", events.HTML)
+            self.assertIsNotNone(match)
+            helpers[name] = match.group(1)
+        script = "const INCIDENT_CONTEXT_ROWS=100;\n"
+        script += "const INCIDENT_REJECTED=new Set(['rejected','rejected_local','rejected_upstream']);\n"
+        script += "const INCIDENT_ERRORS=new Set(['error','fatal','retryable_error']);\n"
+        script += "\n".join(f"const {name}={value};" for name, value in helpers.items())
+        script += r'''
+const cases = [
+  {event:'share_result',status:'rejected_local',error_code:'15',error_message:'stale share'},
+  {event:'submit_block_result',status:'rejected',error_code:'15'},
+  {event:'share_result',status:'accepted_local',error_message:'reconciled error detail'},
+  {event:'verifier_status',status:'degraded'},
+  {event:'viewer_waiting',status:'warning'},
+  {event:'verifier_seed_release',status:'error'},
+  {event:'verify_error',status:'unavailable'},
+  {event:'submit_block_attempt',status:'retryable_error'}
+];
+const rows=Array.from({length:150},(_,index)=>({index}));
+console.log(JSON.stringify({
+  kinds:cases.map(incidentKind),
+  triggers:cases.map(isIncidentTrigger),
+  prior:incidentPriorRows(rows).map(row=>row.index),
+  tail:incidentTailEnd(150)
+}));
+'''
+        output = events.json.loads(subprocess.check_output(["node", "-e", script], text=True))
+        self.assertEqual(output["kinds"], [
+            "stale", "rejected", "", "", "", "error", "error", "error",
+        ])
+        self.assertEqual(output["triggers"], [
+            True, True, False, False, False, True, True, True,
+        ])
+        self.assertEqual(len(output["prior"]), 101)
+        self.assertEqual(output["prior"][0], 49)
+        self.assertEqual(output["prior"][-1], 149)
+        self.assertEqual(output["tail"], 250)
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_persisted_seen_positions_skip_pruned_replays_and_detect_gaps(self):
+        names = (
+            "sequenceBigInt", "positionMap", "normalizeSeenPositions",
+            "setPositionMax", "rowStreamPosition", "rowAlreadySeen",
+            "snapshotHasSequenceGap",
+        )
+        helpers = {}
+        for name in names:
+            match = re.search(rf"  const {name} = (.*?);\n", events.HTML)
+            self.assertIsNotNone(match, name)
+            helpers[name] = match.group(1)
+        script = "\n".join(f"const {name}={value};" for name, value in helpers.items())
+        script += r'''
+const stream='a'.repeat(32),instance='viewer-a';
+const model={seenPositions:normalizeSeenPositions({
+  current_viewer:instance,
+  viewers:{[instance]:'120'},
+  streams:{[stream]:'75'}
+})};
+const oldPruned={stream_id:stream,event_seq:'74',_viewer_seq:119};
+const next={stream_id:stream,event_seq:'76',_viewer_seq:121};
+const streamGap={stream_id:stream,event_seq:'78',_viewer_seq:121};
+console.log(JSON.stringify({
+  prunedReplay:rowAlreadySeen(oldPruned,instance),
+  nextSeen:rowAlreadySeen(next,instance),
+  viewerGap:snapshotHasSequenceGap(instance,123,[{_viewer_seq:122}]),
+  contiguous:snapshotHasSequenceGap(instance,123,[next,{stream_id:stream,event_seq:'77',_viewer_seq:122},{stream_id:stream,event_seq:'78',_viewer_seq:123}]),
+  streamGap:snapshotHasSequenceGap(instance,121,[streamGap]),
+  normalized:model.seenPositions
+}));
+'''
+        output = events.json.loads(subprocess.check_output(["node", "-e", script], text=True))
+        self.assertTrue(output["prunedReplay"])
+        self.assertFalse(output["nextSeen"])
+        self.assertTrue(output["viewerGap"])
+        self.assertFalse(output["contiguous"])
+        self.assertTrue(output["streamGap"])
+        self.assertEqual(output["normalized"]["viewers"]["viewer-a"], "120")
+        self.assertEqual(output["normalized"]["streams"]["a" * 32], "75")
+
+    def test_indexeddb_mutations_are_fenced_by_owner_token_and_generation(self):
+        acquire = re.search(
+            r"  function acquireBrowserLease\(db\).*?\n"
+            r"  function fencedMutation",
+            events.HTML,
+            re.S,
+        )
+        fenced = re.search(
+            r"  function fencedMutation\(.*?\n"
+            r"  (?:async )?function heartbeatBrowserLease",
+            events.HTML,
+            re.S,
+        )
+        self.assertIsNotNone(acquire)
+        self.assertIsNotNone(fenced)
+        self.assertIn("owner:model.storageOwnerId", acquire.group(0))
+        self.assertIn("token:model.storageLeaseToken", acquire.group(0))
+        self.assertIn("generation", acquire.group(0))
+        self.assertIn("'meta'", fenced.group(0))
+        self.assertIn("lease.owner===model.storageOwnerId", fenced.group(0))
+        self.assertIn("lease.token===model.storageLeaseToken", fenced.group(0))
+        self.assertIn(
+            "Number(lease.generation)===model.storageLeaseGeneration",
+            fenced.group(0),
+        )
+        for name, following in (
+            ("heartbeatBrowserLease", "releaseBrowserLease"),
+            ("releaseBrowserLease", "storageFailed"),
+            ("flushBrowserStorage", "queueEventWrite"),
+            ("clearStoredHistory", "restoreBrowserHistory"),
+        ):
+            mutation = re.search(
+                rf"  (?:async )?function {name}\(.*?\n"
+                rf"  (?:async )?function {following}",
+                events.HTML,
+                re.S,
+            )
+            self.assertIsNotNone(mutation, name)
+            self.assertIn("fencedMutation(", mutation.group(0), name)
+
+    def test_expired_matching_lease_is_validated_and_renewed_atomically(self):
+        fenced = re.search(
+            r"  function fencedMutation\(.*?\n"
+            r"  (?:async )?function heartbeatBrowserLease",
+            events.HTML,
+            re.S,
+        )
+        self.assertIsNotNone(fenced)
+        body = fenced.group(0)
+        valid = re.search(r"valid=(.*?);if\(!valid\)", body)
+        self.assertIsNotNone(valid)
+        self.assertIn("lease.owner===model.storageOwnerId", valid.group(1))
+        self.assertIn("lease.token===model.storageLeaseToken", valid.group(1))
+        self.assertIn(
+            "Number(lease.generation)===model.storageLeaseGeneration",
+            valid.group(1),
+        )
+        self.assertNotIn("expires", valid.group(1))
+        renew = "meta.put({...lease,expires:Date.now()+STORAGE_LEASE_MS})"
+        self.assertIn(renew, body)
+        self.assertLess(body.index(renew), body.index("mutate(transaction,meta,lease)"))
+
+    def test_bfcache_stream_messages_wait_for_reacquired_lease(self):
+        stream = re.search(
+            r"  function drainStreamMessages\(.*?\n"
+            r"  function suspendBrowserStorage",
+            events.HTML,
+            re.S,
+        )
+        suspend = re.search(
+            r"  function suspendBrowserStorage\(.*?\n"
+            r"  async function resumeBrowserStorage",
+            events.HTML,
+            re.S,
+        )
+        resume = re.search(
+            r"  async function resumeBrowserStorage\(.*?\n"
+            r"  window\.addEventListener\('pagehide'",
+            events.HTML,
+            re.S,
+        )
+        self.assertIsNotNone(stream)
+        self.assertIsNotNone(suspend)
+        self.assertIsNotNone(resume)
+        self.assertIn(
+            "if(!startupReady||model.storageSuspended)"
+            "startupMessages.push([kind,data])",
+            stream.group(0),
+        )
+        self.assertIn("model.storageSuspended=true", suspend.group(0))
+        resume_body = resume.group(0)
+        reacquire = resume_body.index("await acquireBrowserLease(model.browserDb)")
+        unsuspend = resume_body.index("model.storageSuspended=false", reacquire)
+        drain = resume_body.index("drainStreamMessages()", unsuspend)
+        self.assertLess(reacquire, unsuspend)
+        self.assertLess(unsuspend, drain)
+        self.assertIn(
+            "window.addEventListener('pageshow',event=>"
+            "{if(event.persisted)resumeBrowserStorage();})",
+            events.HTML,
+        )
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_clear_controls_are_enabled_only_when_storage_is_ready(self):
+        helper = re.search(
+            r"  function setBrowserStorageStatus\(.*?\n",
+            events.HTML,
+        )
+        self.assertIsNotNone(helper)
+        script = r'''
+const model={browserStorageStatus:'',browserStorageMessage:''};
+const elements={clear:{disabled:false},clearErrors:{disabled:false}};
+const $=id=>elements[id]||null;
+function renderStorageBadge(){}
+''' + helper.group(0).strip() + r'''
+const states=[];
+for(const status of ['opening','error','ready']){
+  setBrowserStorageStatus(status,status);
+  states.push([elements.clear.disabled,elements.clearErrors.disabled]);
+}
+console.log(JSON.stringify(states));
+'''
+        output = events.json.loads(subprocess.check_output(["node", "-e", script], text=True))
+        self.assertEqual(output, [[True, True], [True, True], [False, False]])
+
+    def test_incident_context_requests_urgent_persistence(self):
+        helper = re.search(
+            r"  function addBrowserEvent\(.*?\n"
+            r"  function removeEventKeys",
+            events.HTML,
+            re.S,
+        )
+        self.assertIsNotNone(helper)
+        trigger = re.search(
+            r"if\(trigger\)\{.*?requestUrgentStorageFlush\(\).*?\}",
+            helper.group(0),
+            re.S,
+        )
+        self.assertIsNotNone(trigger)
+
+    @unittest.skipUnless(shutil.which("node"), "node is unavailable")
+    def test_debug_filters_use_exact_bigints_uuid_and_bounded_reverse_scan(self):
+        names = (
+            "parseMinimumDifficulty", "matchesMinimumDifficulty",
+            "newestMatchingEvents",
+        )
+        helpers = {}
+        for name in names:
+            match = re.search(rf"  const {name} = (.*?);\n", events.HTML)
+            self.assertIsNotNone(match)
+            helpers[name] = match.group(1)
+        script = "const missing=value=>value===null||value===undefined||value==='';\n"
+        script += "\n".join(f"const {name}={value};" for name, value in helpers.items())
+        script += r'''
+const uuid='11111111-2222-5333-8444-555555555555';
+const rows=Array.from({length:1500},(_,index)=>({
+  index,event:'share_result',connection_uuid:uuid,
+  share_diff:String(9007199254740993n+BigInt(index)),
+  __search_text:`m13/p23 share_result ${index}`
+}));
+rows.unshift({index:-1,event:'share_result',connection_uuid:uuid+'x',share_diff:'9999999999999999',__search_text:'m13/p23'});
+let reads=0;
+const proxied=new Proxy(rows,{get(target,property,receiver){if(/^\d+$/.test(String(property)))reads++;return Reflect.get(target,property,receiver);}});
+const result=newestMatchingEvents(proxied,{query:'m13/p23',connectionUuid:uuid,minimumDifficulty:parseMinimumDifficulty('9007199254740993')});
+console.log(JSON.stringify({
+  parsed:[parseMinimumDifficulty('')===null,parseMinimumDifficulty('-1')===undefined,parseMinimumDifficulty('1.5')===undefined],
+  exact:[matchesMinimumDifficulty({share_diff:'9007199254740992'},9007199254740993n),matchesMinimumDifficulty({share_diff:'9007199254740993'},9007199254740993n)],
+  length:result.length,first:result[0].index,last:result[result.length-1].index,reads
+}));
+'''
+        output = events.json.loads(subprocess.check_output(["node", "-e", script], text=True))
+        self.assertEqual(output["parsed"], [True, True, True])
+        self.assertEqual(output["exact"], [False, True])
+        self.assertEqual(output["length"], 1000)
+        self.assertEqual((output["first"], output["last"]), (500, 1499))
+        self.assertLessEqual(output["reads"], 1001)
 
 
 if __name__ == "__main__":
