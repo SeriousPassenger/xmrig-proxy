@@ -3,6 +3,7 @@
 import argparse
 import ast
 import csv
+import hashlib
 import http.client
 import importlib.util
 import io
@@ -1395,48 +1396,133 @@ class WalletRpcTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             events.parse_wallet_rpc_login("missing-colon")
 
-    def test_every_rpc_call_builds_fresh_digest_auth_and_closes_connection(self):
-        requests = []
+    def test_every_rpc_call_completes_digest_auth_on_its_fresh_connection(self):
+        class ConnectionBoundDigestHandler(events.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
 
-        class Response:
-            status = 200
+            def setup(self):
+                super().setup()
+                self.challenge_nonce = ""
+                with self.server.counter_lock:
+                    self.server.connection_count += 1
 
-            def __enter__(self):
-                return self
+            def log_message(self, _format, *_args):
+                pass
 
-            def __exit__(self, *_args):
-                return False
+            def send_body(self, status, body, headers=()):
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
-            @staticmethod
-            def read(_limit):
-                return b'{"jsonrpc":"2.0","id":"dashboard","result":{"in":[]}}'
+            def do_POST(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(content_length)
+                authorization = self.headers.get("Authorization", "")
+                with self.server.counter_lock:
+                    self.server.request_count += 1
+                if not authorization:
+                    self.challenge_nonce = f"connection-{self.server.connection_count}"
+                    self.challenge_body = body
+                    with self.server.counter_lock:
+                        self.server.challenge_sockets.append(self.connection)
+                        self.server.challenge_headers.append(
+                            self.headers.get("Connection", "").lower()
+                        )
+                    self.send_body(401, b"unauthorized", (
+                        (
+                            "WWW-Authenticate",
+                            'Digest qop="auth",algorithm=MD5,realm="monero-rpc",'
+                            f'nonce="{self.challenge_nonce}",stale=false',
+                        ),
+                        (
+                            "WWW-Authenticate",
+                            'Digest qop="auth",algorithm=MD5-sess,realm="monero-rpc",'
+                            f'nonce="{self.challenge_nonce}",stale=false',
+                        ),
+                    ))
+                    return
+                fields = {}
+                if authorization.startswith("Digest "):
+                    fields = events.parse_keqv_list(events.parse_http_list(
+                        authorization[len("Digest "):],
+                    ))
+                ha1 = hashlib.md5(b"user:monero-rpc:pass").hexdigest()
+                ha2 = hashlib.md5(b"POST:/json_rpc").hexdigest()
+                expected = hashlib.md5((
+                    f"{ha1}:{self.challenge_nonce}:{fields.get('nc', '')}:"
+                    f"{fields.get('cnonce', '')}:auth:{ha2}"
+                ).encode("ascii")).hexdigest()
+                authenticated = (
+                    bool(self.challenge_nonce)
+                    and body == self.challenge_body
+                    and fields.get("algorithm", "").upper() == "MD5"
+                    and fields.get("nonce") == self.challenge_nonce
+                    and fields.get("username") == "user"
+                    and fields.get("realm") == "monero-rpc"
+                    and fields.get("uri") == "/json_rpc"
+                    and fields.get("qop") == "auth"
+                    and fields.get("nc") == "00000001"
+                    and fields.get("response") == expected
+                )
+                if authenticated:
+                    with self.server.counter_lock:
+                        self.server.authenticated_count += 1
+                        self.server.authenticated_sockets.append(self.connection)
+                        self.server.authenticated_headers.append(
+                            self.headers.get("Connection", "").lower()
+                        )
+                    self.send_body(
+                        200,
+                        b'{"jsonrpc":"2.0","id":"dashboard","result":{"in":[]}}',
+                        (("Connection", "close"),),
+                    )
+                    return
+                self.send_body(401, b"wrong connection", ((
+                    "WWW-Authenticate",
+                    'Digest qop="auth",algorithm=MD5,realm="monero-rpc",'
+                    'nonce="replacement",stale=true',
+                ), ("Connection", "close")))
 
-        class Opener:
-            @staticmethod
-            def open(request, timeout):
-                requests.append((request, timeout))
-                return Response()
-
+        server = events.ThreadingHTTPServer(
+            ("127.0.0.1", 0), ConnectionBoundDigestHandler,
+        )
+        server.daemon_threads = True
+        server.counter_lock = threading.Lock()
+        server.connection_count = 0
+        server.request_count = 0
+        server.authenticated_count = 0
+        server.challenge_sockets = []
+        server.authenticated_sockets = []
+        server.challenge_headers = []
+        server.authenticated_headers = []
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
         state = events.DashboardState(
             "/tmp/events.sock", 100, 5, wallet_enabled=True,
         )
         poller = events.WalletRpcPoller(
-            "http://127.0.0.1:18082/json_rpc", "user", "pass", 20,
+            f"http://127.0.0.1:{server.server_port}/json_rpc", "user", "pass", 20,
             state, threading.Event(),
         )
-        with mock.patch.object(events, "build_opener", side_effect=lambda *handlers: Opener()) as build:
+        try:
             poller._call("get_transfers", {"in": True})
             poller._call("get_transfers", {"in": True})
-        self.assertEqual(build.call_count, 2)
-        for call in build.call_args_list:
-            self.assertTrue(any(
-                isinstance(handler, events.HTTPDigestAuthHandler)
-                for handler in call.args
-            ))
-        self.assertEqual(len(requests), 2)
-        self.assertTrue(all(
-            request.get_header("Connection") == "close" for request, _ in requests
-        ))
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+        self.assertEqual(server.connection_count, 2)
+        self.assertEqual(server.request_count, 4)
+        self.assertEqual(server.authenticated_count, 2)
+        self.assertIs(server.challenge_sockets[0], server.authenticated_sockets[0])
+        self.assertIs(server.challenge_sockets[1], server.authenticated_sockets[1])
+        self.assertIsNot(server.challenge_sockets[0], server.challenge_sockets[1])
+        self.assertEqual(server.challenge_headers, ["keep-alive", "keep-alive"])
+        self.assertEqual(server.authenticated_headers, ["close", "close"])
 
 
 class PageTest(unittest.TestCase):

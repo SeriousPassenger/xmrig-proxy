@@ -108,11 +108,12 @@ python3 extras/event-dashboard/xmrig_events_web.py \
   --wallet-rpc-login 'USER:PASS'
 ```
 
-The default wallet interval is 20 seconds. Every `get_transfers` poll creates a
-fresh HTTP opener and Digest-auth context, sends `Connection: close`, and
-authenticates that JSON-RPC call independently; it never treats a previous
-challenge nonce or connection as a login session. Only incoming transfers whose
-wallet RPC `type` is `block` are allowlisted. Ordinary incoming payments,
+The default wallet interval is 20 seconds. Every `get_transfers` poll creates
+one fresh TCP connection, receives its Digest challenge, sends the authenticated
+JSON-RPC request on that same connection, and then closes it. Challenge nonces
+and authentication state are never reused between connections or polls. Only
+incoming transfers whose wallet RPC `type` is `block` are allowlisted. Ordinary
+incoming payments,
 outgoing, pool, pending, and failed transfers are neither sent to the browser
 nor stored. The sanitized transaction ID, atomic reward, height, block time,
 confirmations, lock state, and account/subaddress indexes are upserted into the

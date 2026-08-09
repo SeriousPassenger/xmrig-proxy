@@ -8,6 +8,7 @@ import csv
 import datetime as dt
 import errno
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -29,6 +30,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import (
     HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm,
     HTTPRedirectHandler, ProxyHandler, Request, build_opener,
+    parse_http_list, parse_keqv_list,
 )
 
 
@@ -2886,7 +2888,7 @@ class ApiPoller(threading.Thread):
 
 
 class WalletRpcPoller(threading.Thread):
-    """Poll coinbase rewards with a fresh Digest-auth context per RPC call."""
+    """Poll rewards with a complete Digest exchange on one fresh connection."""
 
     MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
@@ -2901,42 +2903,57 @@ class WalletRpcPoller(threading.Thread):
         self.state = state
         self.stop_event = stop_event
 
-    def _new_opener(self) -> Any:
-        # monero-wallet-rpc's --rpc-login uses HTTP Digest. A new password
-        # manager/opener is intentionally built for every JSON-RPC call so a
-        # challenge nonce or authenticated connection is never treated as a
-        # reusable login session.
+    def _new_connection(self, timeout: float) -> http.client.HTTPConnection:
+        parsed = urlsplit(self.endpoint)
+        connection_type = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https" else http.client.HTTPConnection
+        )
+        return connection_type(parsed.hostname, parsed.port, timeout=timeout)
+
+    def _authorization(self, request: Request,
+                       challenges: Sequence[str]) -> str:
+        # Monero advertises MD5 and MD5-sess in separate WWW-Authenticate
+        # fields. Python's digest calculator supports MD5; use it only to
+        # construct the header because urllib's transport always closes the
+        # challenge connection before retrying.
         passwords = HTTPPasswordMgrWithDefaultRealm()
         passwords.add_password(None, self.endpoint, self.username, self.password)
-        return build_opener(
-            ProxyHandler({}), NoRedirectHandler(), HTTPDigestAuthHandler(passwords),
+        digest = HTTPDigestAuthHandler(passwords)
+        for raw_value in challenges:
+            scheme, separator, raw_challenge = raw_value.partition(" ")
+            if not separator or scheme.lower() != "digest":
+                continue
+            try:
+                challenge = parse_keqv_list(parse_http_list(raw_challenge))
+            except ValueError:
+                continue
+            if str(challenge.get("algorithm", "MD5")).upper() != "MD5":
+                continue
+            qop = str(challenge.get("qop", ""))
+            if qop and "auth" not in {
+                value.strip().lower() for value in qop.split(",")
+            }:
+                continue
+            try:
+                value = digest.get_authorization(request, challenge)
+            except (UnicodeError, ValueError, URLError):
+                continue
+            if value:
+                return f"Digest {value}"
+        raise RuntimeError(
+            "wallet RPC did not provide a supported MD5 Digest challenge"
         )
 
-    def _call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        body = json.dumps({
-            "jsonrpc": "2.0", "id": "dashboard", "method": method,
-            "params": params,
-        }, separators=(",", ":")).encode("utf-8")
-        request = Request(
-            self.endpoint, data=body, method="POST",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Connection": "close",
-                "User-Agent": "xmrig-event-dashboard/1",
-            },
-        )
-        opener = self._new_opener()
-        with opener.open(
-            request, timeout=min(15.0, max(3.0, self.interval * 0.75)),
-        ) as response:
-            if response.status != 200:
-                raise RuntimeError(f"wallet RPC returned HTTP {response.status}")
-            encoded = response.read(self.MAX_RESPONSE_BYTES + 1)
+    def _read_response(self, response: http.client.HTTPResponse) -> bytes:
+        encoded = response.read(self.MAX_RESPONSE_BYTES + 1)
         if len(encoded) > self.MAX_RESPONSE_BYTES:
             raise RuntimeError(
                 f"wallet RPC response exceeds {self.MAX_RESPONSE_BYTES} bytes"
             )
+        return encoded
+
+    def _result(self, encoded: bytes) -> Dict[str, Any]:
         try:
             document = json.loads(encoded.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -2952,6 +2969,64 @@ class WalletRpcPoller(threading.Thread):
         if not isinstance(result, dict):
             raise RuntimeError("wallet RPC result is not an object")
         return result
+
+    def _status_error(self, response: http.client.HTTPResponse) -> HTTPError:
+        return HTTPError(
+            self.endpoint, response.status, response.reason,
+            response.headers, None,
+        )
+
+    def _call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": "dashboard", "method": method,
+            "params": params,
+        }, separators=(",", ":")).encode("utf-8")
+        request = Request(self.endpoint, data=body, method="POST")
+        parsed = urlsplit(self.endpoint)
+        request_target = parsed.path or "/"
+        timeout = min(15.0, max(3.0, self.interval * 0.75))
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "xmrig-event-dashboard/1",
+        }
+        connection = self._new_connection(timeout)
+        try:
+            # http_server_auth is owned by Monero's per-connection handler.
+            # Keep this socket alive long enough to answer its nonce challenge.
+            connection.request(
+                "POST", request_target, body=body,
+                headers={**headers, "Connection": "keep-alive"},
+            )
+            challenge_response = connection.getresponse()
+            encoded = self._read_response(challenge_response)
+            if challenge_response.status == 200:
+                return self._result(encoded)
+            if challenge_response.status != 401:
+                raise self._status_error(challenge_response)
+            if challenge_response.will_close or connection.sock is None:
+                raise RuntimeError(
+                    "wallet RPC closed the connection after its Digest challenge"
+                )
+            authorization = self._authorization(
+                request,
+                challenge_response.headers.get_all("WWW-Authenticate") or (),
+            )
+            connection.request(
+                "POST", request_target, body=body,
+                headers={
+                    **headers,
+                    "Authorization": authorization,
+                    "Connection": "close",
+                },
+            )
+            response = connection.getresponse()
+            encoded = self._read_response(response)
+            if response.status != 200:
+                raise self._status_error(response)
+            return self._result(encoded)
+        finally:
+            connection.close()
 
     @staticmethod
     def _error_message(exc: BaseException) -> str:
