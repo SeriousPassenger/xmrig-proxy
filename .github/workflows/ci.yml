@@ -113,7 +113,7 @@ jobs:
             -o "$RUNNER_TEMP/global-share-cache-test"
           "$RUNNER_TEMP/global-share-cache-test"
 
-      - name: Run daemon submission reconciliation contracts
+      - name: Run daemon submission retry contracts
         if: ${{ matrix.name == 'full' }}
         run: |
           g++ \

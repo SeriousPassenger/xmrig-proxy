@@ -37,31 +37,41 @@ public:
         std::string reason;
     };
 
-    struct Match
-    {
-        bool accepted = false;
-        std::string blockId;
-        std::string reason;
-    };
-
-    static constexpr uint32_t kMaxAttempts = 4;
+    static constexpr uint32_t kMaxSubmitAttempts = 4;
     static constexpr uint64_t kRetryDelayMs = 2000;
 
-    static inline bool hasRemainingAttempts(uint32_t completedAttempts)
+    static inline bool hasRemainingSubmitAttempts(uint32_t completedAttempts)
     {
-        return completedAttempts < kMaxAttempts;
+        return completedAttempts < kMaxSubmitAttempts;
     }
 
-    static inline uint64_t nextAttemptAt(uint64_t now)
+    static inline bool shouldRetrySubmit(SubmitDecision::Outcome outcome,
+                                         uint32_t completedAttempts)
+    {
+        return outcome != SubmitDecision::Outcome::Accepted &&
+            hasRemainingSubmitAttempts(completedAttempts);
+    }
+
+    static inline uint64_t nextSubmitAttemptAt(uint64_t now)
     {
         return now + kRetryDelayMs;
     }
 
+    static inline bool isSubmitRetryDue(uint64_t retryAt, uint64_t now)
+    {
+        return retryAt && now >= retryAt;
+    }
+
+    static inline SubmitDecision::Outcome terminalSubmitOutcome(
+        SubmitDecision::Outcome lastOutcome, bool hadIndeterminateOutcome)
+    {
+        return hadIndeterminateOutcome &&
+            lastOutcome != SubmitDecision::Outcome::Accepted
+                ? SubmitDecision::Outcome::Indeterminate
+                : lastOutcome;
+    }
+
     static SubmitDecision classifySubmitResult(const rapidjson::Value &result);
-    static Match matchCanonicalBlock(const rapidjson::Value &result,
-                                     uint64_t expectedHeight,
-                                     const char *expectedMinerTxHash,
-                                     const char *expectedBlockBlob);
 };
 
 

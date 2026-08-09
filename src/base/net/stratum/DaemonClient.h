@@ -88,30 +88,26 @@ private:
         SubmitResult result;
         String blockBlob;
         String minerTxHash;
-        std::string lastIndeterminateError;
-        std::string lastReconcileError;
-        uint64_t attemptStartedMs  = 0;
-        uint64_t reconcileDueMs    = 0;
-        uint32_t reconcileAttempts = 0;
+        std::string lastSubmitError;
+        bool hadIndeterminateOutcome = false;
+        uint64_t attemptStartedMs   = 0;
+        uint64_t retryDueMs         = 0;
+        uint32_t attempts           = 1;
     };
 
-    int64_t beginReconciliationAttempt(int64_t id);
     const JobContext *findContext(const String &jobId) const;
     bool finalizeSubmission(int64_t id, SubmitResult::Outcome outcome, const char *message,
-                            int64_t errorCode = 0, const char *blockId = nullptr,
-                            bool reconciled = false);
+                            int64_t errorCode = 0, const char *blockId = nullptr);
     bool installTemplate(const std::shared_ptr<const DaemonTemplateSource::Snapshot> &snapshot);
-    bool onIndeterminateSubmit(int64_t id, const char *message);
-    bool parseReconcileResponse(int64_t id, const rapidjson::Value &result,
-                                const rapidjson::Value &error);
     bool prepareSpendKey(Job &job, const class BlockTemplate &blocktemplate, const char **error);
     bool parseSubmitResponse(int64_t id, const rapidjson::Value &result, const rapidjson::Value &error);
     void publishSubmissionRow(const char *event, const PendingSubmission &submission,
                               int64_t requestId, const char *status, const char *message = nullptr,
                               int64_t errorCode = 0, const char *blockId = nullptr,
                               bool includeBlockBlob = false) const;
-    bool retryOrFinalizeReconciliation(int64_t id, const char *reason);
-    int64_t startReconciliation(int64_t id, const char *reason);
+    bool retryOrFinalizeSubmission(int64_t id, SubmitResult::Outcome outcome,
+                                   const char *reason, int64_t errorCode = 0);
+    int64_t retrySubmission(int64_t id);
     int64_t rpcSend(const rapidjson::Document &doc,
                     const std::map<std::string, std::string> &headers,
                     int userType);
